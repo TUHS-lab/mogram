@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "tuhss.player",
+  "name": "Player",
+  "version": "0.1.0",
+  "author": "tuhss",
+  "description": "Плеер Mogram (и любой MPRIS) в баре: обложка, перемотка, громкость",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Player",
+    "description": "Управление плеером Mogram",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

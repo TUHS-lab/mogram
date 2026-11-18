@@ -1,0 +1,33 @@
+__id__ = "forwards"
+__name__ = "Пересылки"
+__description__ = "Точное число пересылок (и, если включить, просмотров) в подвале сообщений канала"
+__details__ = 'Что делает: у сообщений в каналах, которые пересылали, в подвале пузыря появляется метка «↪ 1 234» с точным числом пересылок. В настройках плагина можно добавить и точное число просмотров.\nПочему только каналы: Telegram присылает счётчик пересылок только для постов каналов.\nПрава: messages.read (читать сообщения), settings (свои настройки).'
+__author__ = "mogram"
+__version__ = "1.0.1"
+__icon__ = "➡️"
+__min_version__ = "0.1.0"
+__permissions__ = ["messages.read", "settings"]
+
+from base_plugin import BasePlugin, Header, Switch
+from mogram_sdk import api
+
+
+def spaced(n):
+    return '{:,}'.format(int(n)).replace(',', ' ')
+
+
+class Forwards(BasePlugin):
+    def create_settings(self):
+        return [
+            Switch(key="views", text="Показывать и просмотры", default=False,
+                   subtext="Точные числа вместо округлённых «1,2K»"),
+        ]
+
+    def message_badge_hook(self, message):
+        n = message.get('forwards') or 0
+        if n <= 0:
+            return None
+        text = '↪ ' + spaced(n)
+        if api.get_setting('views', False) and message.get('views'):
+            text += '  ' + spaced(message['views'])
+        return text

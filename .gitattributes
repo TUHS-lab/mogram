@@ -1,0 +1,18 @@
+# Set the default behavior, in case people don't have core.autocrlf set.
+* text=auto
+
+# Ensure diffs have LF endings
+*.diff text eol=lf
+*.bat text eol=crlf
+
+# Keep the zxcvbn word lists byte-identical to upstream so their digests hold
+Telegram/Resources/zxcvbn/*.txt text eol=lf
+
+# Ensure lottie animations are treated as binary files
+*.lottie binary
+
+# Raw float tables, such as the 3D diamond model data
+*.bin binary
+
+# Mogram: the signed plugin catalog must stay byte-for-byte as signed.
+plugins-catalog/** -text

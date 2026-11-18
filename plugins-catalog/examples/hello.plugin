@@ -1,0 +1,23 @@
+__id__ = "hello_mog"
+__name__ = "Привет, мока"
+__description__ = "Пробный плагин: пункт в меню сообщения и замена текста"
+__author__ = "tuhss"
+__version__ = "0.1.0"
+__icon__ = "☕"
+__min_version__ = "0.1.0"
+__permissions__ = ["messages.send", "ui"]
+
+from mogram_sdk.base_plugin import BasePlugin, HookResult, HookStrategy, MenuItem
+
+
+class Hello(BasePlugin):
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItem(location="message", text="Привет из плагина",
+                                    action=lambda msg: print("клик по сообщению", msg)))
+
+    def send_message_hook(self, params):
+        text = params.get("text", "")
+        if text.endswith(" :mog:"):
+            params["text"] = text.replace(" :mog:", " ☕")
+            return HookResult(HookStrategy.MODIFY, params)
+        return HookResult()

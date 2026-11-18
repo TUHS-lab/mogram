@@ -1,0 +1,1467 @@
+"""Mogram: хост плагинов (исполняется во встроенном Python клиента).
+
+Читает метаданные без запуска кода, загружает/выгружает плагины с изоляцией ошибок,
+раздаёт хуки по цепочке. С C++ общается через строки JSON.
+"""
+import ast, collections, hashlib, json, os, re, secrets, sys, time, types, traceback
+
+_MOG_CAPS = {
+    'network': {'requests', 'urllib', 'urllib3', 'http', 'socket', 'aiohttp', 'httpx', 'websocket', 'ssl', 'ftplib', 'smtplib'},
+    'files': {'shutil', 'pathlib', 'glob', 'tempfile'},
+    'native': {'ctypes', 'subprocess', 'multiprocessing', 'cffi'},
+}
+
+
+def _mog_parse(source):
+    out = {'meta': {}, 'detected': [], 'evidence': [], 'error': None}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        out['error'] = 'синтаксическая ошибка: %s' % e
+        return json.dumps(out, ensure_ascii=False)
+    meta = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            key = node.targets[0].id
+            if key.startswith('__') and key.endswith('__'):
+                try:
+                    meta[key] = ast.literal_eval(node.value)
+                except Exception:
+                    pass
+    detected = set()
+    evidence = []
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                aliases[item.asname or item.name.split('.')[0]] = item.name
+        elif isinstance(node, ast.ImportFrom):
+            for item in node.names:
+                aliases[item.asname or item.name] = (node.module or '') + '.' + item.name
+
+    def record(capability, node, symbol):
+        detected.add(capability)
+        item = {'capability': capability, 'line': getattr(node, 'lineno', 0), 'symbol': symbol}
+        if item not in evidence and len(evidence) < 200:
+            evidence.append(item)
+
+    def qualified(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            parent = qualified(node.value)
+            return parent + '.' + node.attr if parent else node.attr
+        return ''
+
+    for node in ast.walk(tree):
+        mods = []
+        if isinstance(node, ast.Import):
+            mods = [a.name.split('.')[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            mods = [(node.module or '').split('.')[0]]
+        for m in mods:
+            for cap, names in _MOG_CAPS.items():
+                if m in names:
+                    record(cap, node, m)
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ''
+            resolved = qualified(f) or name
+            root = resolved.split('.')[0]
+            for cap, names in _MOG_CAPS.items():
+                if root in names:
+                    record(cap, node, resolved)
+            if resolved in ('os.system', 'os.popen', 'exec', 'eval', '__import__', 'compile'):
+                record('native', node, resolved)
+            if resolved in ('open', 'io.open', 'os.open', 'os.remove', 'os.unlink', 'os.rename', 'os.listdir'):
+                record('files', node, resolved)
+            call_caps = {
+                'add_hook': 'hooks.observe', 'add_on_update_hook': 'hooks.observe',
+                'add_pre_request_hook': 'hooks.intercept', 'add_post_request_hook': 'hooks.observe',
+                'add_message_filter_hook': 'hooks.intercept', 'add_message_text_hook': 'hooks.intercept',
+                'add_send_message_hook': 'hooks.intercept', 'add_menu_item': 'ui',
+                'show_dialog': 'ui', 'show_toast': 'ui', 'overlay': 'ui',
+                'get_setting': 'settings', 'set_setting': 'settings',
+                'http_get': 'network', 'http_post': 'network',
+            }
+            if name in call_caps:
+                record(call_caps[name], node, name)
+            if isinstance(f, ast.Name):
+                if f.id == 'open':
+                    record('files', node, name)
+                if f.id in ('exec', 'eval', '__import__', 'compile'):
+                    record('native', node, name)
+            elif isinstance(f, ast.Attribute):
+                if f.attr in ('system', 'popen'):
+                    record('native', node, name)
+                if f.attr in ('send_message', 'send_file'):
+                    record('messages.send', node, name)
+                if f.attr in ('get_message', 'chat_info', 'get_dialogs', 'get_history', 'current_chat', 'mark_read', 'get_user_info', 'get_me'):
+                    record('messages.read', node, name)
+                if f.attr in ('edit_message', 'pin_message'):
+                    record('messages.edit', node, name)
+                if f.attr in ('join', 'leave', 'invite', 'ban', 'unban', 'kick', 'restrict', 'edit_admin'):
+                    record('chats.manage', node, name)
+                if f.attr in ('mute', 'archive', 'get_folders', 'folder_add', 'set_typing'):
+                    record('chats.settings', node, name)
+                if f.attr in ('set_profile', 'set_emoji_status'):
+                    record('profile.write', node, name)
+                if f.attr in ('get_privacy', 'set_privacy'):
+                    record('privacy.write', node, name)
+                if f.attr in ('get_entity',):
+                    record('tl.read', node, name)
+                if f.attr in ('invoke_tl', 'press_button'):
+                    record('tl.write', node, name)
+                if f.attr in ('forward_messages', 'react', 'send_album', 'schedule_message', 'save_draft'):
+                    record('messages.send', node, name)
+                if f.attr in ('get_participants', 'search_messages', 'get_history_remote', 'input_peer', 'get_user', 'download_media'):
+                    record('messages.read', node, name)
+                if f.attr in ('delete_messages', 'delete_message'):
+                    record('messages.delete', node, name)
+                if f.attr == 'clipboard_get':
+                    record('clipboard', node, name)
+    for cap in sorted(detected):
+        if not any(item['capability'] == cap for item in evidence):
+            evidence.append({'capability': cap, 'line': 0, 'symbol': ''})
+    out['meta'] = meta
+    out['detected'] = sorted(detected)
+    out['evidence'] = evidence
+    out['sha256'] = hashlib.sha256(source.encode('utf8')).hexdigest()
+    return json.dumps(out, ensure_ascii=False)
+
+
+_MOG_SENSITIVE = {
+    'payments.transferStarGift', 'payments.updateStarGiftPrice', 'payments.convertStarGift',
+    'payments.upgradeStarGift', 'payments.getStarGiftWithdrawalUrl', 'payments.withdrawStarGift',
+    'payments.deleteStarGift', 'payments.craftStarGift', 'payments.sendStarsForm',
+    'payments.sendPaymentForm', 'payments.fulfillStarsSubscription', 'payments.changeStarsSubscription',
+    'payments.getStarsRevenueWithdrawalUrl', 'payments.sendStarGiftOffer',
+    'auth.acceptLoginToken', 'auth.exportAuthorization', 'auth.resetAuthorizations',
+    'account.resetAuthorization', 'account.resetWebAuthorization', 'account.resetWebAuthorizations',
+    'account.deleteAccount', 'account.updatePasswordSettings', 'account.resetPassword',
+    'account.changePhone', 'account.updateConnectedBot', 'account.acceptAuthorization',
+    'account.updateUsername', 'account.toggleUsername', 'account.setAuthorizationTTL',
+    'account.changeAuthorizationSettings', 'account.setPrivacy',
+    'channels.editCreator', 'channels.editAdmin', 'channels.deleteChannel', 'channels.editBanned',
+    'channels.updateUsername', 'channels.toggleUsername', 'channels.updatePaidMessagesPrice',
+    'messages.editChatCreator', 'messages.editChatAdmin', 'messages.deleteChat',
+    'messages.deleteChatUser', 'messages.sendPaidReaction',
+    'wallet.sendTransfer', 'wallet.exportSecretPhrase', 'wallet.replaceWallet',
+    'wallet.enableBackup', 'wallet.disableBackup', 'wallet.tonConnectSubmitConnectResult',
+    'wallet.tonConnectSubmitResponse',
+}
+
+
+def _mog_request_info(encoded):
+    try:
+        raw = bytes.fromhex(encoded)
+        request = sys.modules['mogram_sdk.tl'].decode_request(raw)
+        method = request['_']
+        amounts, targets = [], []
+
+        def walk(value, depth=0):
+            if depth > 8 or not isinstance(value, dict):
+                return
+            for key, item in value.items():
+                if key in ('user_id', 'chat_id', 'channel_id', 'bot_id') and isinstance(item, int):
+                    targets.append(key + ': ' + str(item))
+                elif key in ('allow_paid_stars', 'amount', 'stars', 'resell_amount', 'price', 'send_paid_messages_stars'):
+                    if isinstance(item, int):
+                        amounts.append(key + ': ' + str(item))
+                    elif isinstance(item, dict):
+                        walk(item, depth + 1)
+                elif key == 'count' and method == 'messages.sendPaidReaction':
+                    amounts.append('stars: ' + str(item))
+                elif isinstance(item, dict):
+                    walk(item, depth + 1)
+                elif isinstance(item, list):
+                    for part in item[:20]:
+                        walk(part, depth + 1)
+        walk(request)
+        sensitive = (method in _MOG_SENSITIVE
+                     or bool(request.get('allow_paid_stars'))
+                     or bool(request.get('allow_paid_floodskip'))
+                     or bool(request.get('suggested_post')))
+        # Жёсткий запрет методов, закрытых для плагинов в SDK: мост проверяет сам,
+        # потому что прямой вызов _mog_native обходит Python-проверки SDK.
+        allowed = sys.modules['mogram_sdk.api']._tl_perm(method) is not None
+        return json.dumps({'ok': True, 'method': method, 'sensitive': sensitive, 'allowed': allowed,
+                           'amounts': list(dict.fromkeys(amounts)),
+                           'targets': list(dict.fromkeys(targets)),
+                           'sha256': hashlib.sha256(raw).hexdigest()}, ensure_ascii=False)
+    except Exception:
+        return json.dumps({'ok': False})
+
+
+# ---- журнал: print и ошибки плагинов собираются здесь, C++ забирает через _mog_drain ----
+
+_log = collections.deque()
+
+# Режим разработчика плагинов: MOGRAM_PLUGIN_DEBUG=1 (см. DEVELOPING.md в каталоге плагинов).
+_DEV = bool(os.environ.get('MOGRAM_PLUGIN_DEBUG'))
+
+
+class _LogOut:
+    def __init__(self):
+        self._buf = ''
+
+    def write(self, text):
+        self._buf += text
+        while '\n' in self._buf:
+            line, self._buf = self._buf.split('\n', 1)
+            _log.append(line)
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+sys.stdout = _LogOut()
+sys.stderr = _LogOut()
+
+
+def _mog_drain():
+    # Журнал пишут из нескольких потоков: забираем по одной записи, без гонки на списке.
+    out = []
+    while True:
+        try:
+            out.append(_log.popleft())
+        except IndexError:
+            break
+    return '\n'.join(out)
+
+
+_fw_ring = collections.deque(maxlen=500)
+
+
+def _say(text):
+    _log.append(text)
+    _fw_ring.append(text)
+
+
+# ---- SDK ----
+
+def _mog_install_sdk(source):
+    pkg = types.ModuleType('mogram_sdk')
+    pkg.__path__ = []
+    mod = types.ModuleType('mogram_sdk.base_plugin')
+    sys.modules['mogram_sdk'] = pkg
+    sys.modules['mogram_sdk.base_plugin'] = mod
+    sys.modules['base_plugin'] = mod   # чужие плагины импортируют именно так
+    exec(compile(source, 'mogram_sdk/base_plugin.py', 'exec'), mod.__dict__)
+    pkg.base_plugin = mod
+
+
+def _mog_install_api(source):
+    mod = types.ModuleType('mogram_sdk.api')
+    exec(compile(source, 'mogram_sdk/api.py', 'exec'), mod.__dict__)
+    mod._h.update({
+        'caller': _caller, 'granted': _granted, 'audit': _audit, 'say': _say,
+        'native': _mog_native, 'data_dir': _data_dir, 'register_cb': _register_cb, 'hook_error': _hook_error,
+        'fw': _FW_EXPORT,
+    })
+    sys.modules['mogram_sdk.api'] = mod
+    sys.modules['mog'] = mod
+    sys.modules['mogram_sdk'].api = mod
+
+
+# ---- права, хеш плагина, журнал действий ----
+
+# L0 доступно всегда. L4 в обычном режиме не выдаётся никогда (режим доверия не сделан).
+_L0 = {'ui', 'storage', 'settings', 'background'}
+_L4 = {'raw_api', 'native', 'files.any', 'network.any', 'subprocess'}
+_grants = {}   # id -> {'hash': sha256 файла, 'grants': [права]}
+
+
+def _data_root():
+    return os.path.dirname(_folder.rstrip('/'))
+
+
+def _grants_path():
+    return os.path.join(_data_root(), 'plugin_grants.json')
+
+
+def _data_dir(pid):
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', pid)
+    return os.path.join(_data_root(), 'plugin_data', safe)
+
+
+def _load_grants():
+    try:
+        with open(_grants_path(), encoding='utf8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _grants.update(data)
+    except Exception:
+        pass
+
+
+def _save_grants():
+    try:
+        os.makedirs(_data_root(), exist_ok=True)
+        tmp = _grants_path() + '.tmp'
+        with open(tmp, 'w', encoding='utf8') as f:
+            json.dump(_grants, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, _grants_path())
+    except Exception as e:
+        _say('не удалось сохранить права плагинов: %s' % e)
+
+
+def _sha256(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _default_grants(meta):
+    # Выдаём то, что плагин запросил в __permissions__, кроме опасного уровня L4.
+    declared = meta.get('__permissions__') or []
+    out = []
+    for item in declared if isinstance(declared, (list, tuple)) else []:
+        if isinstance(item, str) and item not in _L4 and item not in out:
+            out.append(item)
+    return out
+
+
+def _granted(pid, perm):
+    if perm in _L0:
+        return True
+    have = _grants.get(pid, {}).get('grants', [])
+    if perm in _L4:
+        return False   # L4 только в режиме доверия (его пока нет)
+    parts = perm.split('.')
+    for i in range(1, len(parts) + 1):
+        if '.'.join(parts[:i]) in have:
+            return True
+    return False
+
+
+def _audit(entry, op, target, decision, size=0):
+    # Строку JSON дописывает C++ (время, ротация 5 МБ x 3). Плагин сюда не пишет.
+    try:
+        rec = _grants.get(entry['id'], {})
+        line = json.dumps({
+            'plugin': entry['id'], 'hash': (rec.get('hash') or '')[:12], 'op': op,
+            'target': str(target)[:200], 'decision': decision, 'size': size,
+        }, ensure_ascii=False)
+        _mog_native('audit', line)
+        if _DEV:
+            calls = entry.setdefault('calls', collections.deque(maxlen=200))
+            calls.append('%s %s %s' % (op, str(target)[:120], decision))
+            _say('[dev] %s: %s %s -> %s' % (entry['id'], op, str(target)[:120], decision))
+    except Exception:
+        pass
+
+
+def _caller():
+    # Какой плагин зовёт SDK: ищем в стеке кадр из файла плагина (имя файла задано в compile),
+    # работает и из чужих потоков. По __name__ нельзя: плагины сами задают __name__ в метаданных.
+    f = sys._getframe(1)
+    while f is not None:
+        path = f.f_code.co_filename
+        for entry in list(_plugins.values()):
+            if entry.get('path') == path:
+                return entry
+        f = f.f_back
+    return None
+
+
+def _toast(text):
+    try:
+        _mog_native('toast', json.dumps({'text': text[:200], 'duration': 4.0}, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _record(entry_name, raw, meta):
+    pid = meta.get('__id__') or entry_name
+    _grants[pid] = {'hash': _sha256(raw), 'grants': _default_grants(meta)}
+    _save_grants()
+    return pid
+
+
+def _mog_record_install(name):
+    """Установка из окна клиента: запоминаем хеш файла и выданные права."""
+    try:
+        with open(os.path.join(_folder, name), 'rb') as f:
+            raw = f.read()
+        meta = json.loads(_mog_parse(raw.decode('utf8')))['meta']
+        pid = _record(name, raw, meta)
+        _say('[%s] установлен, хеш %s' % (pid, _grants[pid]['hash'][:12]))
+        return pid
+    except Exception as e:
+        _say('не удалось записать хеш %s: %s' % (name, e))
+        return ''
+
+
+def _mog_approve(pid):
+    """Пользователь подтвердил изменённый файл: новый хеш и права, запуск."""
+    entry = _plugins.get(pid)
+    if entry is None:
+        return 'false'
+    try:
+        with open(entry['path'], 'rb') as f:
+            raw = f.read()
+        meta = json.loads(_mog_parse(raw.decode('utf8')))['meta']
+        _record(entry['file'], raw, meta)
+    except Exception as e:
+        _say('[%s] не удалось подтвердить: %s' % (pid, e))
+        return 'false'
+    _audit(entry, 'review', '', 'approved')
+    _mog_load_file(entry['file'])
+    return 'true' if _plugins[pid]['state'] == 'loaded' else 'false'
+
+
+# ---- реестр плагинов ----
+
+_folder = ''
+_plugins = {}      # id -> запись; порядок вставки = порядок вызова хуков
+_disabled = set()
+_pinned = set()
+_engine = False      # общий выключатель системы плагинов (по умолчанию выключена)
+
+
+def _state_path():
+    return os.path.join(os.path.dirname(_folder.rstrip('/')), 'plugins_state.json')
+
+
+def _load_state():
+    try:
+        with open(_state_path(), encoding='utf8') as f:
+            data = json.load(f)
+        _disabled.update(data.get('disabled', []))
+        _pinned.update(data.get('pinned', []))
+        global _engine
+        _engine = bool(data.get('engine', False))
+    except Exception:
+        pass
+
+
+def _save_state():
+    try:
+        with open(_state_path(), 'w', encoding='utf8') as f:
+            json.dump({'disabled': sorted(_disabled), 'engine': _engine, 'pinned': sorted(_pinned)}, f, ensure_ascii=False)
+    except Exception as e:
+        _say('не удалось сохранить состояние плагинов: %s' % e)
+
+
+def _fail(entry, exc):
+    entry['plugin'] = None
+    entry['module'] = None
+    entry['state'] = 'error'
+    entry['error'] = ''.join(traceback.format_exception_only(type(exc), exc)).strip()
+    _say('[%s] ошибка: %s' % (entry['id'], entry['error']))
+    _say(traceback.format_exc().rstrip())
+    try:
+        _fw_error_screen(entry, 'Плагин «%s» не запустился' % (entry['meta'].get('__name__') or entry['id']), traceback.format_exc().rstrip())
+    except BaseException:
+        pass
+
+
+def _activate(entry, source):
+    try:
+        base = sys.modules['mogram_sdk.base_plugin'].BasePlugin
+        mod = types.ModuleType('mog_plugin_' + entry['file'].replace('.', '_'))
+        mod.__file__ = entry['path']
+        exec(compile(source, entry['path'], 'exec'), mod.__dict__)
+        cls = None
+        for value in list(mod.__dict__.values()):
+            if (isinstance(value, type) and issubclass(value, base)
+                    and value is not base and value.__module__ == mod.__name__):
+                cls = value
+        if cls is None:
+            raise RuntimeError('в файле нет класса, наследующего BasePlugin')
+        inst = cls()
+        inst._mog_id = entry['id']
+        inst.on_plugin_load()
+        entry['plugin'] = inst
+        entry['module'] = mod
+        entry['state'] = 'loaded'
+        entry['error'] = None
+        entry['hooks_off'] = set()
+        entry['streak'] = {}
+        entry['errors'] = collections.deque()
+        entry['slow'] = {}
+        _register_settings(entry)
+        _register_filters(entry)
+        _register_events(entry)
+        _fw_collect(entry, inst)
+        _fw_sync_updates()
+    except BaseException as e:   # включая SystemExit: плагин не должен ронять клиент
+        _fail(entry, e)
+
+
+# ---- события клиента (новое, изменённое, удалённое сообщение) ----
+
+_EVENTS = ('new_message', 'message_edited', 'message_deleted', 'new_reaction',
+           'chat_opened', 'peer_updated', 'user_status', 'typing', 'message_sent',
+           'scroll', 'theme_changed', 'pointer_move', 'window_shake', 'media_state')
+_UI_EVENTS = ('scroll', 'theme_changed', 'pointer_move', 'window_shake', 'media_state')   # права: ui (всегда есть)
+
+
+def _register_events(entry):
+    inst = entry['plugin']
+    base = sys.modules['mogram_sdk.base_plugin'].BasePlugin
+    names = [e for e in _EVENTS
+             if getattr(type(inst), 'on_' + e, None) is not getattr(base, 'on_' + e, None)]
+    msg_names = [n for n in names if n not in _UI_EVENTS]
+    if msg_names and not _granted(entry['id'], 'messages.read'):
+        _say('[%s] события сообщений: нет права messages.read, не подписан' % entry['id'])
+        _audit(entry, 'events.subscribe', ','.join(msg_names), 'denied')
+        names = [n for n in names if n in _UI_EVENTS]
+    if names:
+        _audit(entry, 'events.subscribe', ','.join(names), 'allowed')
+    base_fn = getattr(base, 'message_filter_hook', None)
+    wants_filter = getattr(type(inst), 'message_filter_hook', None) is not base_fn
+    if wants_filter and not _granted(entry['id'], 'messages.read'):
+        _say('[%s] message_filter_hook: нет права messages.read' % entry['id'])
+        wants_filter = False
+    text_fn = getattr(base, 'message_text_hook', None)
+    wants_text = getattr(type(inst), 'message_text_hook', None) is not text_fn
+    if wants_text and not _granted(entry['id'], 'messages.read'):
+        _say('[%s] message_text_hook: нет права messages.read' % entry['id'])
+        wants_text = False
+    entry['text_hook'] = wants_text
+    badge_fn = getattr(base, 'message_badge_hook', None)
+    wants_badge = getattr(type(inst), 'message_badge_hook', None) is not badge_fn
+    if wants_badge and not _granted(entry['id'], 'messages.read'):
+        _say('[%s] message_badge_hook: нет права messages.read' % entry['id'])
+        wants_badge = False
+    entry['badge_hook'] = wants_badge
+    _mog_native('filter_subscribe', json.dumps({'pid': entry['id'], 'on': wants_badge, 'kind': 'badge'}))
+    _mog_native('filter_subscribe', json.dumps({'pid': entry['id'], 'on': wants_text, 'kind': 'text'}))
+    entry['filter'] = wants_filter
+    _mog_native('filter_subscribe', json.dumps({'pid': entry['id'], 'on': wants_filter}))
+    entry['events'] = set(names)
+    _mog_native('events_subscribe', json.dumps({'pid': entry['id'], 'events': names}))
+
+
+def _mog_filter(message_json):
+    """Главный поток: скрывают ли сообщение плагины. '1' скрыть."""
+    try:
+        message = json.loads(message_json)
+    except Exception:
+        return '0'
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        if inst is None or not entry.get('filter') or 'message_filter_hook' in entry.get('hooks_off', ()):
+            continue
+        started = time.monotonic()
+        try:
+            res = inst.message_filter_hook(dict(message))
+            strategy = getattr(getattr(res, 'strategy', None), 'value', None)
+            hide = (strategy == 'CANCEL') if strategy else bool(res)
+        except BaseException as e:
+            _hook_error(entry, 'message_filter_hook', e)
+            continue
+        if time.monotonic() - started > 0.05:
+            _hook_slow(entry, 'message_filter_hook', time.monotonic() - started, 0.05)
+            continue
+        if hide:
+            return '1'
+    return '0'
+
+
+def _mog_badge_hook(message_json):
+    """Главный поток: подписи плагинов в подвале пузыря, склеиваются через ' · '."""
+    try:
+        message = json.loads(message_json)
+    except Exception:
+        return ''
+    parts = []
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        if inst is None or not entry.get('badge_hook') or 'message_badge_hook' in entry.get('hooks_off', ()):
+            continue
+        started = time.monotonic()
+        try:
+            res = inst.message_badge_hook(dict(message))
+        except BaseException as e:
+            _hook_error(entry, 'message_badge_hook', e)
+            continue
+        if time.monotonic() - started > 0.05:
+            _hook_slow(entry, 'message_badge_hook', time.monotonic() - started, 0.05)
+            continue
+        if isinstance(res, str) and res.strip():
+            parts.append(res.strip().replace('\n', ' '))
+    return ' · '.join(parts)
+
+
+def _mog_text_hook(message_json):
+    """Главный поток: цепочка плагинов меняет текст. '' без изменений, 'T'+текст или 'J'+json {text, entities}.
+    Плагин возвращает строку, dict {'text', 'entities'} или кортеж (текст, сущности)."""
+    try:
+        message = json.loads(message_json)
+    except Exception:
+        return ''
+    changed = False
+    with_entities = False
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        if inst is None or not entry.get('text_hook') or 'message_text_hook' in entry.get('hooks_off', ()):
+            continue
+        started = time.monotonic()
+        try:
+            res = inst.message_text_hook(dict(message))
+        except BaseException as e:
+            _hook_error(entry, 'message_text_hook', e)
+            continue
+        if time.monotonic() - started > 0.05:
+            _hook_slow(entry, 'message_text_hook', time.monotonic() - started, 0.05)
+            continue
+        text = ents = None
+        if isinstance(res, str):
+            text = res
+        elif isinstance(res, dict) and isinstance(res.get('text'), str):
+            text, ents = res['text'], res.get('entities')
+        elif isinstance(res, (tuple, list)) and len(res) == 2 and isinstance(res[0], str):
+            text, ents = res
+        if text is None:
+            continue
+        if ents is not None and isinstance(ents, list):
+            message['entities'] = ents
+            with_entities = True
+            changed = True
+        if text != message['text']:
+            message['text'] = text
+            changed = True
+            if ents is None:
+                message['entities'] = []   # текст изменился, старые смещения не подходят
+                with_entities = True
+    if not changed:
+        return ''
+    if with_entities:
+        return 'J' + json.dumps({'text': message['text'], 'entities': message.get('entities', [])}, ensure_ascii=False)
+    return 'T' + message['text']
+
+
+def _mog_app_event(kind):
+    """START, STOP, PAUSE, RESUME всем включённым плагинам (права не нужны)."""
+    enum = getattr(sys.modules['mogram_sdk.base_plugin'], 'AppEvent', None)
+    ev = getattr(enum, kind, kind) if enum else kind
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        if inst is None or 'on_app_event' in entry.get('hooks_off', ()):
+            continue
+        try:
+            inst.on_app_event(ev)
+        except BaseException as e:
+            _hook_error(entry, 'on_app_event', e)
+
+
+def _mog_event(name, payload_json):
+    """Рабочий поток C++: доставка события плагинам, результат игнорируется."""
+    try:
+        payload = json.loads(payload_json)
+    except Exception:
+        return ''
+    if name == '__cb':
+        # итог асинхронного вызова клиента: {pid, token, payload}
+        try:
+            _mog_invoke(payload['pid'], payload['token'], json.dumps(payload.get('payload') or {}))
+        except Exception:
+            pass
+        return ''
+    try:
+        _fw_event(name, payload)
+    except BaseException:
+        pass
+    if name == 'app_event':
+        _mog_app_event(payload.get('event', ''))
+        return ''
+    hook = 'on_' + name
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        if inst is None or hook in entry.get('hooks_off', ()):
+            continue
+        if name not in entry.get('events', ()):
+            continue
+        fn = getattr(inst, hook, None)
+        if not callable(fn):
+            continue
+        started = time.monotonic()
+        try:
+            _fw_call(entry, fn, dict(payload), 5.0)
+            _hook_ok(entry, hook)
+        except BaseException as e:
+            _hook_error(entry, hook, e)
+        spent = time.monotonic() - started
+        if spent > _OBSERVE_BUDGET:
+            _hook_slow(entry, hook, spent, _OBSERVE_BUDGET)
+    return ''
+
+
+# ---- обратные вызовы клиента в плагин: диалоги, тосты с кнопкой, кнопки интерфейса ----
+
+def _register_cb(entry, fn, once=False):
+    if not callable(fn):
+        return ''
+    # Токены непредсказуемые: последовательный счётчик позволял чужому плагину
+    # нацелить Invoke на чужой колбэк (pid + угаданный номер).
+    token = 'c' + secrets.token_hex(8)
+    entry.setdefault('cbs', {})[token] = (fn, bool(once))
+    return token
+
+
+def _mog_invoke(pid, token, payload_json):
+    if pid == '_fw':
+        fn = _fw_cbs.pop(token, None)
+        if fn is None:
+            return 'false'
+        try:
+            fn(json.loads(payload_json) if payload_json else {})
+        except BaseException as e:
+            _say('каркас: колбэк: %s' % e)
+            return 'false'
+        return 'true'
+    entry = _plugins.get(pid)
+    if entry is None or entry.get('plugin') is None:
+        return 'false'
+    item = entry.get('cbs', {}).get(token)
+    if item is None:
+        return 'false'
+    fn, once = item
+    if once:
+        entry['cbs'].pop(token, None)
+    try:
+        payload = json.loads(payload_json) if payload_json else {}
+        fn(payload)
+    except BaseException as e:
+        _hook_error(entry, 'callback', e)
+        return 'false'
+    return 'true'
+
+
+def _deactivate(entry):
+    try:
+        _mog_native('plugin_unloaded', json.dumps({'pid': entry['id']}))
+    except BaseException:
+        pass
+    entry['cbs'] = {}
+    entry['commands'] = {}
+    entry['watchers'] = []
+    entry['jobs'] = []
+    for sub in [s for s in _fw_db_subs if s[0] == entry['id']]:
+        _fw_db_subs.remove(sub)
+    for t in list(entry.get('timers', {}).values()):
+        t.cancel()
+    entry['timers'] = {}
+    entry['events'] = set()
+    _clear_filters(entry)
+    inst = entry.get('plugin')
+    if inst is not None:
+        try:
+            inst.on_plugin_unload()
+        except BaseException as e:
+            _say('[%s] ошибка при выгрузке: %s' % (entry['id'], e))
+    entry['plugin'] = None
+    entry['module'] = None
+
+
+def _mog_load_file(name):
+    path = os.path.join(_folder, name)
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+        source = raw.decode('utf8')
+    except Exception as e:
+        _say('не прочитать %s: %s' % (name, e))
+        return ''
+    info = json.loads(_mog_parse(source))
+    meta = info['meta']
+    pid = meta.get('__id__') or name
+    old = _plugins.get(pid)
+    if old is not None:
+        _deactivate(old)
+    entry = {'id': pid, 'file': name, 'path': path, 'meta': meta,
+             'plugin': None, 'module': None, 'state': 'error', 'error': info['error']}
+    _plugins[pid] = entry
+    if info['error'] or not meta.get('__id__'):
+        entry['error'] = info['error'] or 'нет поля __id__'
+    elif pid in _disabled:
+        entry['state'] = 'disabled'
+        entry['error'] = None
+    elif not _engine:
+        entry['state'] = 'paused'
+        entry['error'] = None
+    elif _fw_missing_deps(meta):
+        entry['error'] = 'нужны плагины: ' + ', '.join(_fw_missing_deps(meta))
+    else:
+        digest = _sha256(raw)
+        rec = _grants.get(pid)
+        if rec is None:
+            # Файл, о котором клиент ничего не знает (подкинут в папку или остался
+            # от старой версии): не запускаем без явного подтверждения пользователем.
+            _record(name, raw, meta)
+            entry['state'] = 'needs_review'
+            entry['error'] = None
+            _say('[%s] плагин неизвестного происхождения, не запущен до подтверждения' % pid)
+            _audit(entry, 'load', '', 'needs_review')
+        elif rec.get('hash') != digest and _DEV:
+            _record(name, raw, meta)
+            _say('[dev] %s: файл изменён, хеш обновлён автоматически' % pid)
+            _activate(entry, source)
+        elif rec.get('hash') != digest:
+            entry['state'] = 'needs_review'
+            entry['error'] = None
+            _say('[%s] файл изменился после установки, плагин не запущен до подтверждения' % pid)
+            _audit(entry, 'load', '', 'needs_review')
+        else:
+            _activate(entry, source)
+    return pid
+
+
+def _mog_install_tl(source, schema):
+    mod = types.ModuleType('mogram_sdk.tl')
+    exec(compile(source, 'mogram_sdk/tl.py', 'exec'), mod.__dict__)
+    mod._SRC = schema
+    sys.modules['mogram_sdk.tl'] = mod
+    sys.modules['mogram_sdk'].tl = mod
+    return mod
+
+
+def _mog_effective_grants(pid):
+    """Фактически выданные права плагина (для молчаливых обновлений: сверяются они)."""
+    return json.dumps(_grants.get(pid, {}).get('grants', []))
+
+
+def _mog_init(folder, sdk_source, api_source, tl_source='', tl_schema=''):
+    global _folder
+    _folder = folder
+    _install_sdk = _mog_install_sdk
+    _install_sdk(sdk_source)
+    _mog_install_api(api_source)
+    if tl_source:
+        sys.modules['mogram_sdk.api']._h['tl'] = _mog_install_tl(tl_source, tl_schema)
+    _load_state()
+    _load_grants()
+    _fw_load_all(folder)
+    if _DEV:
+        _dev_start(folder)
+    if '_fw_start' in globals():
+        try:
+            _fw_start()
+        except BaseException as e:
+            _say('каркас: %s' % e)
+    return len(_plugins)
+
+
+def _mog_list():
+    out = []
+    for e in _plugins.values():
+        m = e['meta']
+        out.append({
+            'id': e['id'], 'file': e['file'], 'state': e['state'], 'error': e['error'],
+            'enabled': e['id'] not in _disabled,
+            'pinned': e['id'] in _pinned,
+            'name': m.get('__name__', e['id']), 'description': m.get('__description__', ''),
+            'details': str(m.get('__details__', ''))[:4000], 'has_settings': bool(e.get('settings')),
+            'author': m.get('__author__', ''), 'version': m.get('__version__', ''),
+            'icon': m.get('__icon__', ''), 'permissions': m.get('__permissions__', []),
+        })
+    out.sort(key=lambda x: not x['pinned'])
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _mog_set_enabled(pid, enabled):
+    entry = _plugins.get(pid)
+    if entry is None:
+        return 'false'
+    if enabled == '1':
+        _disabled.discard(pid)
+        try:
+            _mog_load_file(entry['file'])
+        except Exception as ex:
+            entry['state'] = 'error'
+            entry['error'] = str(ex)
+    else:
+        # Выключение не должно срываться из-за ошибки в самом плагине:
+        # флаг сохраняется в любом случае.
+        _disabled.add(pid)
+        try:
+            _deactivate(entry)
+        except Exception:
+            pass
+        entry['state'] = 'disabled'
+        entry['error'] = None
+    _save_state()
+    return 'true'
+
+
+def _mog_set_pinned(pid, flag):
+    if pid not in _plugins:
+        return 'false'
+    if flag == '1':
+        _pinned.add(pid)
+    else:
+        _pinned.discard(pid)
+    _save_state()
+    return 'true'
+
+
+def _mog_engine():
+    return '1' if _engine else '0'
+
+
+def _mog_set_engine(flag):
+    global _engine
+    on = (flag == '1')
+    if on == _engine:
+        return 'true'
+    _engine = on
+    for entry in list(_plugins.values()):
+        if on:
+            _mog_load_file(entry['file'])
+        else:
+            _deactivate(entry)
+            if entry['id'] not in _disabled:
+                entry['state'] = 'paused'
+            entry['error'] = None
+    _save_state()
+    return 'true'
+
+
+def _mog_remove(pid):
+    entry = _plugins.pop(pid, None)
+    if entry is None:
+        return 'false'
+    _deactivate(entry)
+    try:
+        _fw_sync_updates()
+    except BaseException:
+        pass
+    _disabled.discard(pid)
+    _save_state()
+    if _grants.pop(pid, None) is not None:
+        _save_grants()
+    try:
+        os.remove(entry['path'])
+    except Exception as e:
+        _say('не удалось удалить файл: %s' % e)
+    return 'true'
+
+
+def _mog_shutdown():
+    try:
+        _mog_app_event('STOP')
+    except BaseException:
+        pass
+    for entry in list(_plugins.values()):
+        _deactivate(entry)
+    return ''
+
+
+# ---- настройки плагина: create_settings() -> реестр настроек клиента ----
+
+def _register_settings(entry):
+    inst = entry['plugin']
+    entry['settings'] = {}
+    try:
+        items = inst.create_settings() or []
+    except BaseException as e:
+        _say('[%s] ошибка в create_settings: %s' % (entry['id'], e))
+        return
+    section = str(entry['meta'].get('__name__') or entry['id'])
+    table = {}
+    out = []
+    plugin_name = section
+    buttons = 0
+    for it in items:
+        cls = type(it).__name__
+        key = getattr(it, 'key', None)
+        if cls == 'Header':
+            section = '%s: %s' % (plugin_name, str(getattr(it, 'text', ''))[:60])
+            continue
+        click = getattr(it, 'on_click', None)
+        if cls in ('Text', 'Button') and callable(click) and buttons < 30:
+            buttons += 1
+            out.append({
+                'key': 'plugin.%s.__button%d' % (entry['id'], buttons), 'section': section,
+                'title': str(getattr(it, 'text', '') or 'Действие')[:120],
+                'description': str(getattr(it, 'subtext', '') or '')[:200],
+                'icon': str(getattr(it, 'icon', '') or ''),
+                'kind': 'button', 'default': '',
+                'pid': entry['id'], 'cb': _register_cb(entry, lambda p, f=click: f(None)),
+            })
+            continue
+        if cls == 'Password' and isinstance(key, str) and key and buttons < 30:
+            buttons += 1
+            out.append({
+                'key': 'plugin.%s.__secret_%s' % (entry['id'], key[:40]), 'section': section,
+                'title': str(getattr(it, 'text', '') or key)[:120],
+                'description': str(getattr(it, 'subtext', '') or 'Хранится зашифрованно')[:200],
+                'icon': str(getattr(it, 'icon', '') or ''),
+                'kind': 'button', 'default': '',
+                'pid': entry['id'], 'cb': _register_cb(entry, lambda p, k=key, t=str(getattr(it, 'text', '') or key): _fw_password_dialog(entry, k, t)),
+            })
+            continue
+        if cls not in ('Switch', 'Selector', 'Input', 'EditText') or not isinstance(key, str) or not key or len(key) > 64:
+            continue
+        item = {
+            'key': 'plugin.%s.%s' % (entry['id'], key), 'section': section,
+            'title': str(getattr(it, 'text', '') or key)[:120],
+            'description': str(getattr(it, 'subtext', '') or '')[:200],
+        }
+        # без своего значка у строки значок самого плагина (эмодзи из его __icon__)
+        own_icon = str(getattr(it, 'icon', '') or '')
+        plugin_icon = str(entry['meta'].get('__icon__', '') or '')
+        if own_icon:
+            item['icon'] = own_icon
+        elif plugin_icon and '/' not in plugin_icon:
+            item['icon'] = 'alt:' + plugin_icon[:8]
+        if cls == 'Switch':
+            item['kind'] = 'bool'
+            item['default'] = bool(it.default)
+        elif cls == 'Selector':
+            choices = [str(x)[:60] for x in (it.items or [])][:50]
+            if not choices:
+                continue
+            item['kind'] = 'choice'
+            item['choices'] = choices
+            item['default'] = it.default if isinstance(it.default, int) and 0 <= it.default < len(choices) else 0
+        else:
+            item['kind'] = 'string'
+            item['default'] = str(it.default or '')[:500]
+        table[key] = {'on_change': getattr(it, 'on_change', None)}
+        out.append(item)
+    entry['settings'] = table
+    if out:
+        res = json.loads(_mog_native('settings_register', json.dumps({'entries': out}, ensure_ascii=False)))
+        if not res.get('ok'):
+            _say('[%s] настройки не зарегистрированы: %s' % (entry['id'], res.get('error')))
+
+
+def _mog_settings_changed(key, value_json):
+    """Клиент сообщает, что пользователь поменял настройку plugin.<id>.<key>."""
+    try:
+        value = json.loads(value_json)[0]
+    except Exception:
+        return ''
+    for entry in list(_plugins.values()):
+        prefix = 'plugin.%s.' % entry['id']
+        inst = entry.get('plugin')
+        if inst is None or not key.startswith(prefix):
+            continue
+        short = key[len(prefix):]
+        try:
+            inst.on_settings_changed(short, value)
+            cb = entry.get('settings', {}).get(short, {}).get('on_change')
+            if callable(cb):
+                cb(value)
+        except BaseException as e:
+            _hook_error(entry, 'on_settings_changed', e)
+    return ''
+
+
+# ---- подписка на хуки обновлений и запросов (фильтр по constructor id живёт в C++) ----
+
+_HOOKS = ('on_update_hook', 'on_updates_hook', 'pre_request_hook', 'post_request_hook')
+_KINDS = ('update', 'updates', 'pre', 'post')
+
+
+def _push_filters(entry, lists):
+    # Формат для C++ без JSON: первая строка id плагина, дальше «номер вида id id id».
+    text = entry['id'] + '\n' + '\n'.join(
+        '%d %s' % (k, ' '.join(str(i) for i in sorted(ids))) for k, ids in lists.items())
+    _mog_native('filters', text)
+
+
+def _clear_filters(entry):
+    if entry.get('filters'):
+        entry['filters'] = {}
+        _push_filters(entry, {})
+
+
+def _register_filters(entry):
+    inst = entry['plugin']
+    base = sys.modules['mogram_sdk.base_plugin'].BasePlugin
+    raw = getattr(entry['module'], '__hook_filters__', None) or getattr(inst, '__hook_filters__', None) or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    lists = {}
+    for kind, hook in enumerate(_HOOKS):
+        fn = getattr(type(inst), hook, None)
+        if fn is None or fn is getattr(base, hook, None):
+            continue   # хук не переопределён
+        if not _granted(entry['id'], 'hooks.observe'):
+            _say('[%s] %s: нет права hooks.observe, хук не подписан' % (entry['id'], hook))
+            _audit(entry, hook, '', 'denied')
+            continue
+        names = raw.get(hook)
+        if not names or not isinstance(names, (list, tuple)):
+            _say('[%s] %s: нужен __hook_filters__ с именами обновлений или методов' % (entry['id'], hook))
+            continue
+        ids = set()
+        for n in names:
+            if n == '*':
+                _say('[%s] %s: подписка на всё запрещена' % (entry['id'], hook))
+            elif isinstance(n, int) and 0 < n <= 0xffffffff:
+                ids.add(n)
+            elif isinstance(n, str) and n in _MOG_TL:
+                ids.add(_MOG_TL[n])
+            else:
+                _say('[%s] %s: неизвестное имя %r' % (entry['id'], hook, n))
+        if ids:
+            lists[kind] = ids
+    entry['filters'] = lists
+    if lists:
+        _push_filters(entry, lists)
+        _audit(entry, 'hooks.subscribe', ','.join(_HOOKS[k] for k in lists), 'allowed')
+
+
+# ---- защита от падений: счётчики ошибок и просрочек ----
+
+def _trip(entry, reason):
+    if _DEV:
+        _say('[dev] %s: %s (в режиме разработчика плагин не отключается)' % (entry['id'], reason))
+        return
+    _deactivate(entry)
+    entry['state'] = 'error'
+    entry['error'] = reason
+    _say('[%s] отключён: %s' % (entry['id'], reason))
+    _audit(entry, 'disable', '', reason)
+    _toast('Плагин «%s» отключён: %s' % (entry['meta'].get('__name__') or entry['id'], reason))
+
+
+def _hook_error(entry, hook, exc):
+    _say('[%s] ошибка в %s: %s' % (entry['id'], hook, exc))
+    _say(traceback.format_exc().rstrip())
+    if _DEV:
+        return
+    errors = entry.get('errors')
+    streak = entry.get('streak')
+    if errors is None or streak is None:
+        return
+    now = time.monotonic()
+    errors.append(now)
+    while errors and now - errors[0] > 60:
+        errors.popleft()
+    streak[hook] = streak.get(hook, 0) + 1
+    if len(errors) >= 20:
+        _trip(entry, '20 ошибок за минуту')
+    elif streak[hook] >= 5:
+        entry['hooks_off'].add(hook)
+        _say('[%s] хук %s выключен: 5 ошибок подряд' % (entry['id'], hook))
+        _toast('Хук %s плагина «%s» выключен из-за ошибок' % (hook, entry['meta'].get('__name__') or entry['id']))
+
+
+def _hook_ok(entry, hook):
+    streak = entry.get('streak')
+    if streak is not None:
+        streak[hook] = 0
+
+
+def _hook_slow(entry, hook, spent, budget):
+    """Просрочка бюджета: 3 раза за минуту выключают хук. Прервать Python-код в потоке нельзя, только отключить."""
+    if _DEV:
+        _say('[dev] %s: %s работал %d мс при бюджете %d мс' % (entry['id'], hook, spent * 1000, budget * 1000))
+        return
+    slow = entry.setdefault('slow', {}).setdefault(hook, collections.deque())
+    now = time.monotonic()
+    slow.append(now)
+    while slow and now - slow[0] > 60:
+        slow.popleft()
+    _say('[%s] %s работал %d мс при бюджете %d мс' % (entry['id'], hook, spent * 1000, budget * 1000))
+    if len(slow) >= 3 and hook not in entry.get('hooks_off', ()):
+        entry['hooks_off'].add(hook)
+        _say('[%s] хук %s выключен: 3 просрочки за минуту' % (entry['id'], hook))
+        _toast('Хук %s плагина «%s» выключен: слишком медленный' % (hook, entry['meta'].get('__name__') or entry['id']))
+
+
+class _TLRaw:
+    """Сырой TL-объект: разбора полей пока нет, есть имя, constructor id и байты."""
+
+    def __init__(self, constructor, raw):
+        self.constructor = constructor
+        self.raw = raw
+        self.name = _TL_NAMES.get(constructor) or ('0x%08x' % constructor)
+
+    def to_bytes(self):
+        return self.raw
+
+    def to_dict(self):
+        return {'_': self.name, 'constructor': self.constructor, 'raw': self.raw.hex()}
+
+    def __repr__(self):
+        return '<TL %s %d байт>' % (self.name, len(self.raw))
+
+
+_TL_NAMES = {v: k for k, v in _MOG_TL.items()}
+_RPC_ERROR = _MOG_TL.get('rpc_error', 0x2144ca19)
+
+
+def _tl_error(raw):
+    # rpc_error#2144ca19 error_code:int error_message:string
+    try:
+        code = int.from_bytes(raw[4:8], 'little', signed=True)
+        n = raw[8]
+        start = 9
+        if n == 254:
+            n = int.from_bytes(raw[9:12], 'little')
+            start = 12
+        return {'code': code, 'message': raw[start:start + n].decode('utf8', 'replace')}
+    except Exception:
+        return {'code': 0, 'message': ''}
+
+
+_OBSERVE_BUDGET = 0.2   # секунд на плагин в рабочем потоке
+
+
+def _mog_hook_observe(kind, ctor, hexdata):
+    """Вызывается рабочим потоком C++. Наблюдение: результат плагина игнорируется."""
+    try:
+        kind = int(kind)
+        ctor = int(ctor)
+        hook = _HOOKS[kind]
+        raw = bytes.fromhex(hexdata)
+    except Exception as e:
+        _say('хук: неверные данные: %s' % e)
+        return ''
+    try:
+        _fw_observe(kind, ctor, raw)
+    except BaseException:
+        pass
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        ids = entry.get('filters', {}).get(kind)
+        if inst is None or not ids or ctor not in ids or hook in entry.get('hooks_off', ()):
+            continue
+        fn = getattr(inst, hook, None)
+        if not callable(fn):
+            continue
+        started = time.monotonic()
+        try:
+            if kind == 3:
+                # ctor это метод запроса, в raw ответ сервера
+                if raw[:4] == _RPC_ERROR.to_bytes(4, 'little'):
+                    fn(None, _tl_error(raw))
+                else:
+                    fn(_TLRaw(int.from_bytes(raw[:4], 'little'), raw), None)
+            else:
+                fn(_TLRaw(ctor, raw))
+            _hook_ok(entry, hook)
+        except BaseException as e:
+            _hook_error(entry, hook, e)
+        spent = time.monotonic() - started
+        if spent > _OBSERVE_BUDGET:
+            _hook_slow(entry, hook, spent, _OBSERVE_BUDGET)
+    return ''
+
+
+# ---- хуки ----
+
+_HOOK_BUDGETS = {'send_message_hook': 0.15}   # секунд, перехват в главном потоке
+
+
+def _mog_hook(name, params_json):
+    cur = json.loads(params_json)
+    if name == 'send_message_hook':
+        res = _run_command(cur)
+        if res:
+            return res if isinstance(res, str) else json.dumps({'cancel': True})
+    budget = _HOOK_BUDGETS.get(name, 0.15)
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        fn = getattr(inst, name, None) if inst is not None else None
+        if fn is None or name in entry.get('hooks_off', ()):
+            continue
+        started = time.monotonic()
+        try:
+            result = fn(cur)
+            _hook_ok(entry, name)
+        except BaseException as e:
+            _hook_error(entry, name, e)
+            continue
+        spent = time.monotonic() - started
+        if spent > budget:
+            # Не уложился в бюджет: результат отбрасываем, данные идут дальше как были.
+            _hook_slow(entry, name, spent, budget)
+            continue
+        if result is None:
+            continue
+        strategy = getattr(result, 'strategy', None)
+        strategy = str(getattr(strategy, 'value', strategy))
+        if strategy == 'CANCEL':
+            return json.dumps({'cancel': True}, ensure_ascii=False)
+        if strategy in ('MODIFY', 'MODIFY_FINAL'):
+            value = getattr(result, 'value', None)
+            if value is not None:
+                cur = value
+            if strategy == 'MODIFY_FINAL':
+                break
+    return json.dumps({'cancel': False, 'value': cur}, ensure_ascii=False, default=str)
+
+
+# ---- пункты меню ----
+
+_LOCATIONS = {
+    'MESSAGE_CONTEXT_MENU': 'message',
+    'DRAWER_MENU': 'drawer',
+    'CHAT_ACTION_MENU': 'chat',
+    'PROFILE_ACTION_MENU': 'profile',
+    'ATTACH_MENU': 'attach',
+    'MAIN_MENU': 'drawer',
+    'HEADER_BUTTON': 'header',
+    'COMPOSER_BUTTON': 'composer',
+}
+
+
+def _item_location(item):
+    loc = getattr(item, 'location', None)
+    if loc is None:
+        loc = getattr(item, 'menu_type', None)
+    loc = str(getattr(loc, 'value', loc))
+    return _LOCATIONS.get(loc, loc)
+
+
+def _item_action(item):
+    return getattr(item, 'action', None) or getattr(item, 'on_click', None)
+
+
+def _mog_menu_items(location, ctx_json):
+    ctx = json.loads(ctx_json)
+    out = []
+    for entry in list(_plugins.values()):
+        inst = entry.get('plugin')
+        if inst is None:
+            continue
+        for index, item in enumerate(getattr(inst, '_menu_items', [])):
+            if _item_location(item) != location or getattr(item, '_removed', False):
+                continue
+            cond = getattr(item, 'condition', None)
+            if callable(cond):
+                try:
+                    if not cond(ctx):
+                        continue
+                except BaseException as e:
+                    _say('[%s] ошибка в condition: %s' % (entry['id'], e))
+                    continue
+            out.append({'pid': entry['id'], 'index': index, 'text': str(getattr(item, 'text', '')),
+                        'icon': str(getattr(item, 'icon', '') or ''),
+                        'priority': int(getattr(item, 'priority', 0) or 0)})
+    out.sort(key=lambda e: -e['priority'])
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _mog_menu_click(pid, index, ctx_json):
+    entry = _plugins.get(pid)
+    if entry is None or entry.get('plugin') is None:
+        return 'false'
+    try:
+        item = entry['plugin']._menu_items[int(index)]
+        action = _item_action(item)
+        if callable(action):
+            action(json.loads(ctx_json))
+    except BaseException as e:
+        _hook_error(entry, 'menu_click', e)
+        return 'false'
+    return 'true'
+
+
+# ---- режим разработчика: автоперезагрузка, команды из файла, дамп состояния ----
+
+def _dev_out(text):
+    _say(text)
+    try:
+        d = os.path.join(_folder, '.dev')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'out.txt'), 'a', encoding='utf8') as f:
+            f.write(text + '\n')
+    except Exception:
+        pass
+
+
+def _dev_find(arg):
+    arg = (arg or '').strip()
+    if arg in _plugins:
+        return _plugins[arg]
+    for e in _plugins.values():
+        if e['file'] == arg or e['file'] == arg + '.plugin':
+            return e
+    if len(_plugins) == 1:
+        return next(iter(_plugins.values()))
+    return None
+
+
+def _dev_command(line):
+    parts = line.strip().split(None, 2)
+    if not parts:
+        return
+    cmd = parts[0]
+    if cmd == 'list':
+        for e in _plugins.values():
+            _dev_out('[dev] %s file=%s state=%s%s' % (e['id'], e['file'], e['state'], ' error=' + str(e['error']) if e.get('error') else ''))
+        return
+    entry = _dev_find(parts[1] if len(parts) > 1 else '')
+    if entry is None:
+        _dev_out('[dev] нет такого плагина: %s (команда list покажет всех)' % (parts[1] if len(parts) > 1 else ''))
+        return
+    if cmd == 'reload':
+        _dev_out('[dev] перезагрузка %s' % entry['file'])
+        _mog_load_file(entry['file'])
+    elif cmd == 'state':
+        _dev_out('[dev] %s state=%s error=%s hooks_off=%s timers=%d overlays=%s' % (
+            entry['id'], entry['state'], entry.get('error'), sorted(entry.get('hooks_off', ())),
+            len(entry.get('timers', {})), sorted(entry.get('overlays', {}))))
+    elif cmd == 'calls':
+        n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
+        for c in list(entry.get('calls', []))[-n:]:
+            _dev_out('[dev] ' + c)
+    elif cmd == 'eval':
+        code = parts[2] if len(parts) > 2 else ''
+        mod = entry.get('module')
+        if mod is None:
+            _dev_out('[dev] плагин не загружен')
+            return
+        ns = dict(mod.__dict__)
+        ns['self'] = entry.get('plugin')
+        try:
+            try:
+                res = eval(compile(code, '<dev>', 'eval'), ns)
+                _dev_out('[dev] = %r' % (res,))
+            except SyntaxError:
+                exec(compile(code, '<dev>', 'exec'), ns)
+                _dev_out('[dev] выполнено')
+        except BaseException:
+            _dev_out('[dev] ошибка:\n' + traceback.format_exc().rstrip())
+    else:
+        _dev_out('[dev] команды: list, reload <id>, state <id>, calls <id> [n], eval <id> <код>')
+
+
+def _dev_loop(folder):
+    import threading
+    seen = {}
+    cmd_path = os.path.join(folder, '.dev', 'cmd')
+    os.makedirs(os.path.dirname(cmd_path), exist_ok=True)
+    for n in os.listdir(folder):
+        if n.endswith('.plugin'):
+            try:
+                seen[n] = os.stat(os.path.join(folder, n)).st_mtime_ns
+            except OSError:
+                pass
+    while True:
+        time.sleep(0.5)
+        try:
+            for n in sorted(os.listdir(folder)):
+                if not n.endswith('.plugin'):
+                    continue
+                m = os.stat(os.path.join(folder, n)).st_mtime_ns
+                if seen.get(n) != m:
+                    first = n not in seen
+                    seen[n] = m
+                    time.sleep(0.2)   # дождаться конца записи
+                    _dev_out('[dev] %s %s, загрузка' % (n, 'новый' if first else 'изменён'))
+                    _mog_load_file(n)
+            if os.path.exists(cmd_path) and os.path.getsize(cmd_path):
+                with open(cmd_path, 'r', encoding='utf8') as f:
+                    lines = f.read().splitlines()
+                open(cmd_path, 'w').close()
+                for line in lines:
+                    _dev_command(line)
+        except BaseException:
+            _say('[dev] сбой наблюдателя:\n' + traceback.format_exc().rstrip())
+
+
+def _dev_start(folder):
+    import threading
+    threading.Thread(target=_dev_loop, args=(folder,), daemon=True, name='mog-dev').start()
+    _say('[dev] режим разработчика: слежу за %s, команды в %s' % (folder, os.path.join(folder, '.dev', 'cmd')))

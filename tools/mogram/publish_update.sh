@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Usage: tools/mogram/publish_update.sh [path/to/Telegram] ["notes"]
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/../.." && pwd)
+binary=${1:-$root/../build/bin/Telegram}
+notes=${2:-}
+key=${MOGRAM_UPDATE_KEY:-$HOME/.config/mogram/update-key.pem}
+remote=${MOGRAM_UPDATE_REMOTE:-tier:/var/www/mog-up/}
+platform=linux-x64
+file=mogram-$platform.xz
+header=$root/Telegram/SourceFiles/mogram/update/mogram_update.h
+
+version=$(sed -n 's/^constexpr auto kVersion = \([0-9]*\);$/\1/p' "$header")
+title=$(sed -n 's/^constexpr auto kVersionTitle = "\(.*\)";$/\1/p' "$header")
+if [[ -z "$version" || -z "$title" ]]; then
+	echo "Не нашёл kVersion и kVersionTitle в $header" >&2
+	exit 1
+fi
+if [[ ! -f "$binary" ]]; then
+	echo "Нет сборки: $binary" >&2
+	exit 1
+fi
+if [[ ! -f "$key" ]]; then
+	echo "Нет ключа подписи: $key" >&2
+	exit 1
+fi
+mode=$(stat -c %a "$key")
+if [[ "$mode" != "600" && "$mode" != "400" ]]; then
+	echo "Права на ключ $key: $mode. Нужны 600 (chmod 600 $key)." >&2
+	exit 1
+fi
+
+published=$(curl -fsSL "https://up.mog.wtf/update.json" 2>/dev/null \
+	| python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo 0)
+if (( version <= published )); then
+	echo "На up.mog.wtf уже версия $published. Увеличьте kVersion в $header и пересоберите." >&2
+	exit 1
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir "$work/repo"
+
+echo "Упаковываю $binary..."
+strip -o "$work/binary" "$binary"
+xz -T0 -9 -c "$work/binary" > "$work/repo/$file"
+size=$(stat -c %s "$work/repo/$file")
+sha256=$(sha256sum "$work/repo/$file" | cut -d' ' -f1)
+
+# Сообщение должно совпадать байт-в-байт с SignedMessage() в
+# Telegram/SourceFiles/mogram/update/mogram_update.cpp:
+# платформа, версия, sha256, размер, файл, заголовок, примечания.
+printf 'mogram-update\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+	"$platform" "$version" "$sha256" "$size" "$file" "$title" "$notes" > "$work/message"
+openssl pkeyutl -sign -rawin -inkey "$key" -in "$work/message" -out "$work/signature"
+signature=$(base64 -w0 "$work/signature")
+
+VERSION=$version TITLE=$title NOTES=$notes PLATFORM=$platform FILE=$file SIZE=$size \
+SHA256=$sha256 SIGNATURE=$signature python3 - > "$work/repo/update.json" <<'EOF'
+import json, os
+e = os.environ
+print(json.dumps({
+    "version": int(e["VERSION"]),
+    "title": e["TITLE"],
+    "notes": e["NOTES"],
+    e["PLATFORM"]: {
+        "file": e["FILE"],
+        "size": int(e["SIZE"]),
+        "sha256": e["SHA256"],
+        "signature": e["SIGNATURE"],
+    },
+}, ensure_ascii=False, indent=2))
+EOF
+
+echo "Публикую Mogram $title ($size байт) на $remote..."
+# сначала файл, потом манифест: клиент не должен увидеть update.json раньше пакета
+rsync -e ssh "$work/repo/$file" "$remote"
+rsync -e ssh "$work/repo/update.json" "$remote"
+echo "Готово."
