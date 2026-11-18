@@ -46,6 +46,7 @@ You do not need to build anything: download a ready build.
 | System | Version | File |
 |---|---|---|
 | **Windows x64** | v0.2.0 | [mogram-win-x64.zip](https://github.com/TUHS-lab/mogram/releases/download/v0.2.0/mogram-win-x64.zip): unzip and run `Mogram.exe` |
+| **macOS** | build once | one command: [docs/MACOS.md](docs/MACOS.md) |
 | **Linux x86_64** | build once | one command, Docker does the rest: [docs/LINUX.md](docs/LINUX.md) |
 
 The Windows build is not signed, so the system may warn you on first launch: choose "More info", then "Run anyway".
@@ -60,9 +61,9 @@ Full description: [docs-plugins-api.md](docs-plugins-api.md), example: [examples
 
 Mogram is built the same way as Telegram Desktop:
 
-- [macOS](docs/building-mac.md)
+- [macOS](docs/MACOS.md)
 - [Windows](docs/building-win.md)
-- [GNU/Linux (Docker)](docs/building-linux.md)
+- [GNU/Linux](docs/LINUX.md)
 
 Repository layout: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). The Telegram Desktop sources and the list of third-party libraries: [telegramdesktop/tdesktop](https://github.com/telegramdesktop/tdesktop).
 

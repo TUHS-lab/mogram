@@ -43,7 +43,7 @@
 
 | Система | Версия | Файл |
 |---|---|---|
-| **macOS Apple Silicon (arm64)** | v0.1.8 | [mogram-arm64.dmg](https://github.com/TUHS-lab/mogram/releases/download/v0.1.8/Mogram-0.1.8-arm64.dmg) |
+| **macOS** | собрать один раз | одна команда: [docs/MACOS.md](docs/MACOS.md) |
 | **Windows x64** | v0.2.0 | [mogram-win-x64.zip](https://github.com/TUHS-lab/mogram/releases/download/v0.2.0/mogram-win-x64.zip) |
 | **Linux x86_64** | собрать один раз | одна команда, остальное делает Docker: [docs/LINUX.md](docs/LINUX.md) |
 
@@ -59,9 +59,9 @@
 
 Mogram собирается так же, как Telegram Desktop:
 
-- [macOS](docs/building-mac.md)
+- [macOS](docs/MACOS.md)
 - [Windows](docs/building-win.md)
-- [GNU/Linux (Docker)](docs/building-linux.md)
+- [GNU/Linux](docs/LINUX.md)
 
 Устройство репозитория: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Исходники Telegram Desktop и список сторонних библиотек: [telegramdesktop/tdesktop](https://github.com/telegramdesktop/tdesktop).
 
