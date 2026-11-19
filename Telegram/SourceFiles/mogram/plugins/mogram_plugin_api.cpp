@@ -257,14 +257,8 @@ template <typename Callback>
 		return callback();
 	}
 	auto promise = std::make_shared<std::promise<std::string>>();
-	// 0 ожидает, 1 выполняется, 2 отменено до начала.
-	const auto state = std::make_shared<std::atomic<int>>(0);
 	auto future = promise->get_future();
 	crl::on_main([=]() mutable {
-		auto expected = 0;
-		if (!state->compare_exchange_strong(expected, 1)) {
-			return;
-		}
 		promise->set_value(callback());
 	});
 	for (auto waited = 0; waited != 50; ++waited) {
@@ -276,11 +270,7 @@ template <typename Callback>
 			break;
 		}
 	}
-	auto expected = 0;
-	if (state->compare_exchange_strong(expected, 2)) {
-		return Reply(false, U(Mogram::Lang::Tr("клиент не ответил вовремя")));
-	}
-	return Reply(false, U(Mogram::Lang::Tr("операция началась, результат неизвестен")));
+	return Reply(false, U(Mogram::Lang::Tr("клиент не ответил вовремя")));
 }
 
 std::string ShowToast(const QJsonObject &args) {
@@ -2108,11 +2098,11 @@ std::string InvokeRaw(const QJsonObject &args) {
 
 std::atomic<int> FilterCount = 0;
 std::set<std::string> FilterPlugins;
-std::map<FullMsgId, std::pair<QString, bool>> FilterCache;
+std::map<FullMsgId, bool> FilterCache;
 
 std::atomic<int> TextHookCount = 0;
 std::set<std::string> TextHookPlugins;
-std::map<FullMsgId, std::pair<TextWithEntities, TextWithEntities>> TextTransformCache;
+std::map<FullMsgId, std::pair<TimeId, TextWithEntities>> TextTransformCache;
 
 std::atomic<int> BadgeHookCount = 0;
 std::set<std::string> BadgeHookPlugins;
@@ -3169,9 +3159,9 @@ void TransformMessageText(
 		return;
 	}
 	const auto id = item->fullId();
-	const auto original = text;
+	const auto edited = TimeId(qHash(item->originalText().text) & 0x7fffffff);
 	const auto i = TextTransformCache.find(id);
-	if (i != TextTransformCache.end() && i->second.first == original) {
+	if (i != TextTransformCache.end() && i->second.first == edited) {
 		text = i->second.second;
 		return;
 	}
@@ -3186,7 +3176,7 @@ void TransformMessageText(
 	message.insert("date", double(item->date()));
 	const auto answer = CallTextHook(Json(message), PluginLog);
 	if (answer.size() < 1) {
-		TextTransformCache[id] = { original, text };
+		TextTransformCache[id] = { edited, text };
 		return;
 	}
 	if (answer[0] == 'T') {
@@ -3204,7 +3194,7 @@ void TransformMessageText(
 			EntitiesFromJson(object.value("entities").toArray(), changed.size(), true),
 		};
 	}
-	TextTransformCache[id] = { original, text };
+	TextTransformCache[id] = { edited, text };
 }
 
 QString MessageBadge(not_null<const HistoryItem*> item) {
@@ -3232,16 +3222,15 @@ bool HiddenByPlugin(not_null<const HistoryItem*> item) {
 		return false;
 	}
 	const auto id = item->fullId();
-	const auto &text = item->originalText().text;
 	const auto i = FilterCache.find(id);
-	if (i != FilterCache.end() && i->second.first == text) {
-		return i->second.second;
+	if (i != FilterCache.end()) {
+		return i->second;
 	}
 	if (FilterCache.size() > 5000) {
 		FilterCache.clear();
 	}
 	const auto result = CallMessageFilter(Json(ItemBrief(item)), PluginLog);
-	FilterCache[id] = { text, result };
+	FilterCache[id] = result;
 	return result;
 }
 

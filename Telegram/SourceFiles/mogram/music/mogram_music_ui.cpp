@@ -1135,11 +1135,11 @@ void EnsureFile(
 }
 
 void UploadTrack(
-		not_null<Data::Thread*> thread,
+		not_null<History*> history,
 		const Track &track,
 		const QString &path,
 		const QImage &cover) {
-	const auto session = &thread->owningHistory()->session();
+	const auto session = &history->session();
 	auto list = Storage::PrepareMediaList(
 		QStringList{ NamedCopy(track, path) },
 		st::sendMediaPreviewSize,
@@ -1169,7 +1169,7 @@ void UploadTrack(
 		song->cover = cover;
 	}
 	file.type = Ui::PreparedFile::Type::Music;
-	auto action = Api::SendAction(thread);
+	auto action = Api::SendAction(history);
 	action.clearDraft = false;
 	session->api().sendFiles(
 		std::move(list),
@@ -1179,18 +1179,18 @@ void UploadTrack(
 }
 
 void SendTrack(
-		not_null<Data::Thread*> thread,
+		not_null<History*> history,
 		const Track &track,
 		const QString &path) {
 	const auto cover = CoverForDocument(DocumentIdForTrack(track.id));
 	if (!cover.isNull() || track.artworkUrl.isEmpty()) {
-		UploadTrack(thread, track, path, cover);
+		UploadTrack(history, track, path, cover);
 		return;
 	}
-	const auto weak = base::make_weak(thread);
+	const auto weak = base::make_weak(history.get());
 	LoadImage(ArtUrl(track.artworkUrl, u"t500x500"_q), [=](QImage image) {
-		if (const auto thread = weak.get()) {
-			UploadTrack(thread, track, path, image);
+		if (const auto history = weak.get()) {
+			UploadTrack(history, track, path, image);
 		}
 	});
 }
@@ -1230,10 +1230,10 @@ void ForwardTrack(
 	Window::ShowChooseRecipientBox(
 		controller,
 		[=](not_null<Data::Thread*> thread) {
-			const auto weak = base::make_weak(thread);
+			const auto weak = base::make_weak(thread->owningHistory().get());
 			EnsureFile(track, [=](const QString &path, const Track &track) {
-				if (const auto thread = weak.get()) {
-					SendTrack(thread, track, path);
+				if (const auto history = weak.get()) {
+					SendTrack(history, track, path);
 				}
 			});
 			return true;
@@ -2181,20 +2181,18 @@ public:
 		} else if (!IsTelegramTrack(_track)) {
 			_likeButton = Ui::CreateChild<TrackLikeButton>(this, _track);
 		}
-		if (_mode != RowMode::Home) {
-			_equalizerTimer.setInterval(33);
-			connect(&_equalizerTimer, &QTimer::timeout, this, [=] {
-				_equalizerPhase += _equalizerClock.restart() / 1000.;
-				update();
-			});
-			Media::Player::instance()->updatedNotifier(
-			) | rpl::on_next([=] { updateAnimation(); }, lifetime());
-			PowerSaving::Changes(
-			) | rpl::on_next([=] { updateAnimation(); }, lifetime());
-			connect(qApp, &QGuiApplication::applicationStateChanged, this, [=] {
-				updateAnimation();
-			});
-		}
+		_equalizerTimer.setInterval(33);
+		connect(&_equalizerTimer, &QTimer::timeout, this, [=] {
+			_equalizerPhase += _equalizerClock.restart() / 1000.;
+			update();
+		});
+		Media::Player::instance()->updatedNotifier(
+		) | rpl::on_next([=] { updateAnimation(); }, lifetime());
+		PowerSaving::Changes(
+		) | rpl::on_next([=] { updateAnimation(); }, lifetime());
+		connect(qApp, &QGuiApplication::applicationStateChanged, this, [=] {
+			updateAnimation();
+		});
 		{
 			if (const auto item = TrackMessage(track)) {
 				const auto document = item->media()->document();
@@ -2855,22 +2853,17 @@ private:
 };
 
 void Row::updateAnimation() {
-	if (_mode == RowMode::Home) {
-		return;
-	}
-	const auto eligible = isVisible()
+	const auto instance = Media::Player::instance();
+	const auto state = instance->getState(AudioMsgId::Type::Song);
+	const auto animate = (_mode != RowMode::Home)
+		&& isVisible()
 		&& QGuiApplication::applicationState() == Qt::ApplicationActive
 		&& QueueState().currentId == _track.id
-		&& !PowerSaving::On(PowerSaving::kAnimations);
-	if (!eligible) {
-		_equalizerTimer.stop();
-		return;
-	}
-	const auto state = Media::Player::instance()->getState(AudioMsgId::Type::Song);
-	const auto animate = UsesQueue(state.id)
+		&& UsesQueue(state.id)
 		&& (state.state == Media::Player::State::Playing
 			|| state.state == Media::Player::State::Starting
-			|| state.state == Media::Player::State::Resuming);
+			|| state.state == Media::Player::State::Resuming)
+		&& !PowerSaving::On(PowerSaving::kAnimations);
 	if (animate && !_equalizerTimer.isActive()) {
 		_equalizerClock.start();
 		_equalizerTimer.start();
@@ -6537,16 +6530,11 @@ public:
 			}
 			update();
 		});
-		connect(qApp, &QGuiApplication::applicationStateChanged, this, [=] {
-			setLoading(_loading);
-		});
 	}
 
 	void setLoading(bool loading) {
 		_loading = loading;
-		if (_loading && isVisible()
-			&& QGuiApplication::applicationState() == Qt::ApplicationActive
-			&& !PowerSaving::On(PowerSaving::kAnimations)) {
+		if (_loading && isVisible() && !PowerSaving::On(PowerSaving::kAnimations)) {
 			_clock.start();
 			_timer.start();
 		} else {
@@ -6590,7 +6578,6 @@ constexpr auto kBarHeight = 108;
 constexpr auto kBarMaxWidth = 1040;
 constexpr auto kBarCover = 72;
 constexpr auto kBarRadius = 40;
-constexpr auto kHomeTrendingSection = 3;
 
 // Акцент обложки, поднятый до читаемой светлоты; белый без него.
 [[nodiscard]] QColor LiftedAccent(QColor accent) {
@@ -6726,11 +6713,25 @@ public:
 				0,
 				_tabTransitionNow);
 		}, lifetime());
+		_topFade = Ui::CreateChild<HomeEdgeFade>(this, HomeEdgeFade::Edge::Top);
+		_topFade->setColor([=] {
+			auto color = pageBackgroundAt(_topFade->y());
+			if (_tab == Tab::Home && _homeArtistOpen && !_homeArtistBannerUrl.isEmpty()) {
+				color.setAlphaF(std::clamp(_tabScroll->scrollTop() / double(style::ConvertScale(128)), 0., 1.));
+			}
+			return color;
+		});
+		_bottomFade = Ui::CreateChild<HomeEdgeFade>(this, HomeEdgeFade::Edge::Bottom);
+		_bottomFade->setColor([=] { return pageBackgroundAt(_bottomFade->y() + _bottomFade->height()); });
 		_homeMoreRetryTimer.setSingleShot(true);
 		connect(&_homeMoreRetryTimer, &QTimer::timeout, this, [=] {
 			scheduleHomeMoreIfNeeded();
 		});
 		_tabScroll->scrollTopChanges() | rpl::on_next([=](int top) {
+			_topFade->setVisible(_tab != Tab::Now
+				&& ((_tab != Tab::Search && _tab != Tab::Library && _tab != Tab::Queue) || top > 0));
+			_topFade->update();
+			_bottomFade->update();
 			if (_tab == Tab::Home && _homeAlbumOpen) {
 				update();
 			}
@@ -6846,7 +6847,7 @@ public:
 		_kindSwitch->hide();
 		QueueState().changes.events(
 		) | rpl::on_next([=] {
-			if (showsQueue()) {
+			if (_tab == Tab::Queue) {
 				rebuildTab();
 			}
 		}, lifetime());
@@ -6965,21 +6966,6 @@ public:
 		LyricsAvailabilityChanges() | rpl::on_next([=] { relayout(); }, lifetime());
 		Mogram::Settings::Changed() | rpl::on_next([=](const QString &key) {
 			if (key == u"lyrics.comments"_q) relayout();
-			if (key == u"player.hide_trending"_q) {
-				const auto closeTrending = (_homeSection == kHomeTrendingSection)
-					&& Mogram::Settings::Bool(key);
-				if (closeTrending) {
-					_homeSection = 0;
-					_homeAlbumReturnScroll = _homeFeedScroll;
-				}
-				if (_tab == Tab::Home && !_homeSection && !_homeAlbumOpen) {
-					rebuildTab();
-					if (closeTrending) {
-						_tabScroll->scrollToY(_homeFeedScroll);
-					}
-				}
-				return;
-			}
 			if (key.startsWith(u"player."_q)) {
 				if (key == u"player.motion_covers"_q || key == u"player.spotify_canvas"_q) {
 					_motionFor.clear();
@@ -7001,13 +6987,10 @@ public:
 			}
 			_seek->update();
 		});
-		connect(qApp, &QGuiApplication::applicationStateChanged, this, [=] {
-			updateAmbientTimer();
-		});
+		_ambientTimer.start();
 
 		PowerSaving::Changes(
 		) | rpl::on_next([=] {
-			updateAmbientTimer();
 			update();
 			_view->update();
 		}, lifetime());
@@ -7043,7 +7026,6 @@ public:
 			return;
 		}
 		_closing = true;
-		_ambientTimer.stop();
 		if (_cancelMotion) _cancelMotion();
 		_motionCover = nullptr;
 		_spotifyCanvas = nullptr;
@@ -7062,14 +7044,6 @@ public:
 	}
 
 protected:
-	void showEvent(QShowEvent *event) override {
-		RpWidget::showEvent(event);
-		updateAmbientTimer();
-	}
-	void hideEvent(QHideEvent *event) override {
-		_ambientTimer.stop();
-		RpWidget::hideEvent(event);
-	}
 	bool eventFilter(QObject *watched, QEvent *event) override {
 		if (_tab == Tab::Search && event->type() == QEvent::KeyPress) {
 			const auto key = static_cast<QKeyEvent*>(event);
@@ -7231,9 +7205,6 @@ protected:
 		int controlsWidth = 0;
 		int controlsTop = 0;
 	};
-	[[nodiscard]] bool showsQueue() const {
-		return _tab == Tab::Queue || (_tab == Tab::Now && _lyricsMissing);
-	}
 	[[nodiscard]] Layout computeLayout() const {
 		const auto s = [](int v) { return style::ConvertScale(v); };
 		auto result = Layout();
@@ -7294,10 +7265,6 @@ protected:
 				top,
 				std::max(width() - margin - lyricsLeft, 0),
 				areaHeight);
-			if (showsQueue()) {
-				result.center = result.lyrics;
-				result.scrollTop = result.center.y();
-			}
 		} else {
 			const auto contentWidth = std::max(width() - ((_tab == Tab::Home && _homeArtistOpen) ? 0 : 2 * margin), 0);
 			result.center = QRect((width() - contentWidth) / 2, top, contentWidth, areaHeight);
@@ -7467,9 +7434,9 @@ protected:
 			_volume->setGeometry(layout.volume);
 		}
 		_seek->setGeometry(layout.seek);
-		_view->setVisible(_tab == Tab::Now && !showsQueue());
+		_view->setVisible(_tab == Tab::Now);
 		_view->setGeometry(layout.lyrics);
-		_tabScroll->setVisible(_tab != Tab::Now || showsQueue());
+		_tabScroll->setVisible(_tab != Tab::Now);
 		_tabScroll->setGeometry(
 			layout.center.x(),
 			layout.scrollTop,
@@ -7477,6 +7444,18 @@ protected:
 			std::max(layout.center.y() + layout.center.height() - layout.scrollTop - s(12), 0));
 		_tabList->resizeToWidth(_tabScroll->width());
 		if (_homeAlbumHeader) _homeAlbumHeader->setBannerTopInset(_tabScroll->y());
+		_topFade->setVisible(_tab != Tab::Now
+			&& ((_tab != Tab::Search && _tab != Tab::Library && _tab != Tab::Queue) || _tabScroll->scrollTop() > 0));
+		_topFade->setGeometry(
+			_tabScroll->x(), _tabScroll->y(), _tabScroll->width(), s(28));
+		_topFade->raise();
+		_bottomFade->setVisible(_tab != Tab::Now);
+		_bottomFade->setGeometry(
+			_tabScroll->x(),
+			_tabScroll->y() + _tabScroll->height() - s(36),
+			_tabScroll->width(),
+			s(36));
+		_bottomFade->raise();
 
 		// Навигация: ряд пилюль сверху по центру.
 		{
@@ -8246,9 +8225,6 @@ protected:
 		};
 		switch (_tab) {
 		case Tab::Now:
-			if (showsQueue()) {
-				fillQueue();
-			}
 			break;
 		case Tab::Home: {
 			const auto &queue = QueueState();
@@ -8390,7 +8366,7 @@ protected:
 					&& !((_homeSection - 100) % 2)
 					&& page < int(_homePages.size());
 				const auto title = (_homeSection == 2) ? tr("Избранное")
-					: (_homeSection == kHomeTrendingSection) ? tr("Trending")
+					: (_homeSection == 3) ? tr("Trending")
 					: (_homeSection == 4) ? tr("Weekly Wave")
 					: (_homeSection == 5) ? tr("Daily Drops")
 					: tr("Для вас");
@@ -8403,7 +8379,7 @@ protected:
 				const auto emptyTracks = std::vector<Track>();
 				const auto &tracks = pageTracks ? _homePages[page].tracks
 					: (_homeSection == 2) ? liked
-					: (_homeSection == kHomeTrendingSection) ? _homeTrending
+					: (_homeSection == 3) ? _homeTrending
 					: (_homeSection == 4 || _homeSection == 5) ? emptyTracks
 					: queue.forYou;
 				auto albums = pageTracks ? _homePages[page].albums : std::vector<Album>();
@@ -8421,7 +8397,7 @@ protected:
 				} else {
 					const auto offset = pageTracks ? _homePages[page].shelfOffset
 						: (_homeSection == 2) ? _homeLikedOffset
-						: (_homeSection == kHomeTrendingSection) ? _homeTrendingOffset
+						: (_homeSection == 3) ? _homeTrendingOffset
 						: (_homeSection == 4) ? _homeWeeklyWaveOffset
 						: (_homeSection == 5) ? _homeDailyDropsOffset
 						: std::shared_ptr<int>();
@@ -8494,9 +8470,7 @@ protected:
 				4,
 				_homeWeeklyWave,
 				_homeWeeklyWaveOffset);
-			if (!Mogram::Settings::Bool(u"player.hide_trending"_q)) {
-				section(tr("Trending"), kHomeTrendingSection, _homeTrending);
-			}
+			section(tr("Trending"), 3, _homeTrending);
 			playlistSection(
 				tr("Daily Drops"),
 				5,
@@ -8674,7 +8648,7 @@ protected:
 			}
 		}
 		_tabList->resizeToWidth(_tabScroll->width());
-		if (!showsQueue()) {
+		if (_tab != Tab::Queue) {
 			_tabScroll->scrollToY(keep);
 		}
 		update();
@@ -8697,7 +8671,7 @@ protected:
 						session,
 						crl::guard(this, [=](std::vector<Track> list, QString) {
 							ContextTracks() = std::move(list);
-							if (showsQueue()) {
+							if (_tab == Tab::Queue) {
 								rebuildTab();
 							}
 						}),
@@ -8817,9 +8791,9 @@ protected:
 		};
 
 		// Открытая вкладка лежит на карточке; на «Сейчас играет» обложка и текст прямо на фоне.
-		if ((_tab != Tab::Now || showsQueue()) && !(_tab == Tab::Home && _homeAlbumOpen)) {
+		if (_tab != Tab::Now && !(_tab == Tab::Home && _homeAlbumOpen)) {
 			if (_tab != Tab::Home && _tab != Tab::Library
-				&& _tab != Tab::Playlists && _tab != Tab::Search && !showsQueue()) {
+				&& _tab != Tab::Playlists && _tab != Tab::Search && _tab != Tab::Queue) {
 				p.setFont(labelFont(19, true));
 				p.setPen(Qt::white);
 				p.drawText(
@@ -9256,8 +9230,6 @@ private:
 			return;
 		}
 		if (track.id.isEmpty()) {
-			_isPlaying = false;
-			updateAmbientTimer();
 			if (_cancelMotion) _cancelMotion();
 			_cancelMotion = nullptr;
 			_motionFor.clear();
@@ -9325,7 +9297,6 @@ private:
 			track.title, track.artist, playing && _tab == Tab::Now);
 		if (_isPlaying != playing) {
 			_isPlaying = playing;
-			updateAmbientTimer();
 			_playAnim.start([=] { update(); }, playing ? 0. : 1., playing ? 1. : 0., 180, anim::easeOutCubic);
 		}
 		_play->setPlaying(playing);
@@ -9369,16 +9340,12 @@ private:
 		_view->setPosition(state.position * 1000 / frequency, playing);
 		if (_queueFor != track.id) {
 			_queueFor = track.id;
-			if (showsQueue()) {
+			if (_tab == Tab::Queue) {
 				rebuildTab();
 			}
 		}
 		if (_lyricsFor != track.id) {
 			_lyricsFor = track.id;
-			if (std::exchange(_lyricsMissing, false) && _tab == Tab::Now) {
-				relayout();
-				rebuildTab();
-			}
 			_view->setCommentsTrack(QString());
 			ResolveCommentsTrack(track, crl::guard(this, [=, id = track.id](QString sc) {
 				if (_lyricsFor == id) _view->setCommentsTrack(sc);
@@ -9392,12 +9359,7 @@ private:
 				track.durationMs,
 				crl::guard(this, [=](Lyrics lyrics) {
 					if (_lyricsFor == id) {
-						_lyricsMissing = !lyrics.found || lyrics.lines.empty();
 						_view->setLyrics(std::move(lyrics));
-						if (_tab == Tab::Now) {
-							relayout();
-							rebuildTab();
-						}
 					}
 				}));
 		}
@@ -9441,6 +9403,8 @@ private:
 			tint.blueF() + (base.blueF() - tint.blueF()) * t);
 	}
 
+	HomeEdgeFade *_topFade = nullptr;
+	HomeEdgeFade *_bottomFade = nullptr;
 	Ui::VerticalLayout *_tabList = nullptr;
 	QPointer<HomeAlbumHeader> _homeAlbumHeader;
 	std::array<NavItem*, 6> _nav = {};
@@ -9473,7 +9437,6 @@ private:
 	QString _searchStatus;
 	int _searchGen = 0;
 	bool _searchChats = false;
-	bool _lyricsMissing = false;
 	Tab _tab = Tab::Now;
 	Tab _rebuiltTab = Tab::Queue;
 	bool _librarySyncLoading = false;
@@ -9550,16 +9513,6 @@ private:
 	QImage _spotifyPaletteFrame;
 	QString _canvasPaletteFor;
 	crl::time _canvasPaletteNext = 0;
-	void updateAmbientTimer() {
-		const auto needed = !_closing && isVisible() && _isPlaying
-			&& QGuiApplication::applicationState() == Qt::ApplicationActive
-			&& !PowerSaving::On(PowerSaving::kAnimations);
-		if (needed && !_ambientTimer.isActive()) {
-			_ambientTimer.start();
-		} else if (!needed) {
-			_ambientTimer.stop();
-		}
-	}
 	QTimer _ambientTimer;
 	Media::Clip::ReaderPointer _motionCover;
 	Media::Clip::ReaderPointer _playlistsSticker;
