@@ -170,6 +170,18 @@ void SetupFlexibleRegularScroll(
 			settle->callOnce(140);
 		}
 	}, scroll->lifetime());
+	// Mogram: при возврате из раздела (например, подарков) прокрутка
+	// восстанавливается раньше, чем считается высота содержимого, и шапка
+	// остаётся в промежуточном виде, пока что-то не сдвинет прокрутку. Поэтому
+	// выравниваем и при изменении высоты содержимого.
+	rpl::combine(
+		inner->heightValue(),
+		scroll->heightValue()
+	) | rpl::on_next([=](int, int) {
+		if (!state->animation.animating()) {
+			settle->callOnce(60);
+		}
+	}, scroll->lifetime());
 	scroll->setCustomWheelProcess([=](not_null<QWheelEvent*> e) {
 		const auto delta = e->angleDelta().y();
 		if (std::abs(delta) != 120 || e->phase() != Qt::NoScrollPhase) {
