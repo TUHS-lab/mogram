@@ -485,6 +485,12 @@ void RegisterSettings() {
 		.defaultValue = true,
 	});
 	playerEntry({
+		.key = u"player.hide_trending"_q,
+		.title = QString::fromUtf8(Mogram::Lang::Tr("Скрыть Trending на главной")),
+		.kind = S::Kind::Bool,
+		.defaultValue = false,
+	});
+	playerEntry({
 		.key = u"music.hint_sticker"_q,
 		.title = u"music.hint_sticker"_q,
 		.kind = S::Kind::String,
