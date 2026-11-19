@@ -918,7 +918,15 @@ public:
 			return;
 		}
 		_expire.start();
-		if (_ready && _circle == circleInWindow && size() == _window->size()) {
+		const auto similar = [](int a, int b) {
+			return std::abs(a - b) <= 2;
+		};
+		if (_ready
+			&& size() == _window->size()
+			&& similar(_circle.x(), circleInWindow.x())
+			&& similar(_circle.y(), circleInWindow.y())
+			&& similar(_circle.width(), circleInWindow.width())
+			&& similar(_circle.height(), circleInWindow.height())) {
 			return;
 		}
 		_circle = circleInWindow;
@@ -935,6 +943,7 @@ public:
 protected:
 	void paintEvent(QPaintEvent *e) override {
 		auto p = QPainter(this);
+		p.setOpacity(_fade.value(1.));
 		if (!_blurred.isNull()) {
 			p.drawPixmap(rect(), _blurred);
 		}
@@ -976,17 +985,37 @@ private:
 		_ready = true;
 		show();
 		raise();
+		_fade.start([=] { update(); }, 0., 1., 280, anim::easeOutCubic);
 	}
 
 	void updateMask() {
-		// Окно без маски вокруг кружка: запас, чтобы время и подпись не терялись.
-		const auto pad = style::ConvertScale(28);
-		const auto hole = _circle.adjusted(-pad, -pad, pad, pad);
+		// Чистыми остаются только кружок и две маленькие пилюли (длительность
+		// слева, время отправки справа), всё остальное размыто.
+		const auto c = _circle;
+		const auto pillTop = c.bottom() - style::ConvertScale(34);
+		const auto pillH = style::ConvertScale(36);
+		const auto pillW = style::ConvertScale(78);
+		const auto radius = style::ConvertScale(14);
 		auto path = QPainterPath();
 		path.addRect(QRectF(rect()));
-		auto cut = QPainterPath();
-		cut.addRoundedRect(QRectF(hole), pad, pad);
-		setMask(QRegion(path.subtracted(cut).toFillPolygon().toPolygon()));
+		auto clear = QPainterPath();
+		clear.addEllipse(QRectF(c));
+		auto left = QPainterPath();
+		left.addRoundedRect(
+			QRectF(c.left() + style::ConvertScale(2), pillTop, pillW, pillH),
+			radius,
+			radius);
+		auto right = QPainterPath();
+		right.addRoundedRect(
+			QRectF(
+				c.right() - pillW + style::ConvertScale(26),
+				pillTop,
+				pillW,
+				pillH),
+			radius,
+			radius);
+		clear = clear.united(left).united(right);
+		setMask(QRegion(path.subtracted(clear).toFillPolygon().toPolygon()));
 	}
 
 	const not_null<QWidget*> _window;
@@ -996,6 +1025,7 @@ private:
 	bool _ready = false;
 	bool _capturing = false;
 	bool _dismissed = false;
+	Ui::Animations::Simple _fade;
 
 };
 
