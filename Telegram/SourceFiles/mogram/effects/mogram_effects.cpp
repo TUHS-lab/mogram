@@ -1011,23 +1011,29 @@ private:
 		path.addRect(QRectF(rect()));
 		auto clear = QPainterPath();
 		clear.addEllipse(QRectF(c).adjusted(-1, -1, 1, 1));
+		// Запас вокруг пилюли: цифры не должны обрезаться.
+		const auto grow = [&](QRectF r) {
+			const auto side = style::ConvertScale(8);
+			const auto vert = style::ConvertScale(4);
+			return r.adjusted(-side, -vert, side, vert);
+		};
 		const auto addPill = [&](QRectF r) {
 			const auto radius = r.height() / 2.;
 			clear.addRoundedRect(r, radius, radius);
 		};
 		if (!_leftPill.isEmpty()) {
-			addPill(QRectF(
+			addPill(grow(QRectF(
 				m.left() + gap,
 				m.bottom() - gap - _leftPill.height(),
 				_leftPill.width(),
-				_leftPill.height()));
+				_leftPill.height())));
 		}
 		if (!_rightPill.isEmpty()) {
-			addPill(QRectF(
+			addPill(grow(QRectF(
 				m.right() - gap - _rightPill.width(),
 				m.bottom() - gap - _rightPill.height(),
 				_rightPill.width(),
-				_rightPill.height()));
+				_rightPill.height())));
 		}
 		setMask(QRegion(path.subtracted(clear).toFillPolygon().toPolygon()));
 	}
@@ -1085,7 +1091,7 @@ void RoundFocusUpdate(
 	// Долгая пауза без вызовов значит, что начался новый просмотр кружка.
 	if (now - RoundFocusLastCall > 1500) {
 		RoundFocusOverlay::RoundFocusDismissedFlag() = false;
-		RoundFocusSession = (now - RoundFocusLastPress) < 6000;
+		RoundFocusSession = (now - RoundFocusLastPress) < 15000;
 	}
 	RoundFocusLastCall = now;
 	if (!RoundFocusSession
