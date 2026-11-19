@@ -604,7 +604,10 @@ void BuildTiles(Burst &b, int cell, int maxTiles, double speed) {
 
 } // namespace
 
+void InstallRoundFocusFilter();
+
 void RegisterSettings() {
+	InstallRoundFocusFilter();
 	const auto del = QString::fromUtf8(Mogram::Lang::Tr("Эффект удаления сообщений"));
 	const auto add = [](S::Entry entry, const QString &section, const char *icon) {
 		entry.section = section;
@@ -913,10 +916,17 @@ public:
 		connect(&_expire, &QTimer::timeout, this, [=] { deleteLater(); });
 	}
 
-	void setCircle(QRect circleInWindow) {
+	void setCircle(
+			QRect circleInWindow,
+			QRect mediaInWindow,
+			QSize leftPill,
+			QSize rightPill) {
 		if (_capturing) {
 			return;
 		}
+		_media = mediaInWindow;
+		_leftPill = leftPill;
+		_rightPill = rightPill;
 		_expire.start();
 		const auto similar = [](int a, int b) {
 			return std::abs(a - b) <= 2;
@@ -926,10 +936,13 @@ public:
 			&& similar(_circle.x(), circleInWindow.x())
 			&& similar(_circle.y(), circleInWindow.y())
 			&& similar(_circle.width(), circleInWindow.width())
-			&& similar(_circle.height(), circleInWindow.height())) {
+			&& similar(_circle.height(), circleInWindow.height())
+			&& similar(_mediaMask.x(), mediaInWindow.x())
+			&& similar(_mediaMask.y(), mediaInWindow.y())) {
 			return;
 		}
 		_circle = circleInWindow;
+		_mediaMask = mediaInWindow;
 		if (!_ready || size() != _window->size()) {
 			capture();
 		}
@@ -989,38 +1002,43 @@ private:
 	}
 
 	void updateMask() {
-		// Чистыми остаются только кружок и две маленькие пилюли (длительность
-		// слева, время отправки справа), всё остальное размыто.
+		// Чисто остаются только кружок и две пилюли точно по их размеру (длительность
+		// слева, время справа). Всё остальное, и фон за пилюлями, размыто.
 		const auto c = _circle;
-		const auto pillTop = c.bottom() - style::ConvertScale(34);
-		const auto pillH = style::ConvertScale(36);
-		const auto pillW = style::ConvertScale(78);
-		const auto radius = style::ConvertScale(14);
+		const auto m = _media.isEmpty() ? c : _media;
+		const auto gap = style::ConvertScale(4);
 		auto path = QPainterPath();
 		path.addRect(QRectF(rect()));
 		auto clear = QPainterPath();
-		clear.addEllipse(QRectF(c));
-		auto left = QPainterPath();
-		left.addRoundedRect(
-			QRectF(c.left() + style::ConvertScale(2), pillTop, pillW, pillH),
-			radius,
-			radius);
-		auto right = QPainterPath();
-		right.addRoundedRect(
-			QRectF(
-				c.right() - pillW + style::ConvertScale(26),
-				pillTop,
-				pillW,
-				pillH),
-			radius,
-			radius);
-		clear = clear.united(left).united(right);
+		clear.addEllipse(QRectF(c).adjusted(-1, -1, 1, 1));
+		const auto addPill = [&](QRectF r) {
+			const auto radius = r.height() / 2.;
+			clear.addRoundedRect(r, radius, radius);
+		};
+		if (!_leftPill.isEmpty()) {
+			addPill(QRectF(
+				m.left() + gap,
+				m.bottom() - gap - _leftPill.height(),
+				_leftPill.width(),
+				_leftPill.height()));
+		}
+		if (!_rightPill.isEmpty()) {
+			addPill(QRectF(
+				m.right() - gap - _rightPill.width(),
+				m.bottom() - gap - _rightPill.height(),
+				_rightPill.width(),
+				_rightPill.height()));
+		}
 		setMask(QRegion(path.subtracted(clear).toFillPolygon().toPolygon()));
 	}
 
 	const not_null<QWidget*> _window;
 	QPixmap _blurred;
 	QRect _circle;
+	QRect _mediaMask;
+	QRect _media;
+	QSize _leftPill;
+	QSize _rightPill;
 	QTimer _expire;
 	bool _ready = false;
 	bool _capturing = false;
@@ -1031,33 +1049,64 @@ private:
 
 QPointer<RoundFocusOverlay> RoundFocusCurrent;
 crl::time RoundFocusLastCall = 0;
+crl::time RoundFocusLastPress = 0;
+bool RoundFocusSession = false;
+
+// Размытие включается, только если кружок запущен после нажатия мыши:
+// следующий кружок, который клиент включает сам, размытие не вызывает.
+class PressFilter final : public QObject {
+protected:
+	bool eventFilter(QObject *watched, QEvent *event) override {
+		if (event->type() == QEvent::MouseButtonPress) {
+			RoundFocusLastPress = crl::now();
+		}
+		return false;
+	}
+
+};
 
 } // namespace
 
-void RoundFocusUpdate(not_null<QWidget*> widget, QRect rectInWidget) {
-	if (!S::Bool(u"fx.round_focus"_q) || rectInWidget.isEmpty()) {
+void InstallRoundFocusFilter() {
+	static const auto filter = new PressFilter();
+	qApp->installEventFilter(filter);
+}
+
+void RoundFocusUpdate(
+		not_null<QWidget*> widget,
+		QRect circleInWidget,
+		QRect mediaInWidget,
+		QSize leftPill,
+		QSize rightPill) {
+	if (!S::Bool(u"fx.round_focus"_q) || circleInWidget.isEmpty()) {
 		return;
 	}
 	const auto now = crl::now();
-	// Долгая пауза без вызовов значит, что это уже другой просмотр кружка.
+	// Долгая пауза без вызовов значит, что начался новый просмотр кружка.
 	if (now - RoundFocusLastCall > 1500) {
 		RoundFocusOverlay::RoundFocusDismissedFlag() = false;
+		RoundFocusSession = (now - RoundFocusLastPress) < 6000;
 	}
 	RoundFocusLastCall = now;
-	if (RoundFocusOverlay::RoundFocusDismissedFlag()) {
+	if (!RoundFocusSession
+		|| RoundFocusOverlay::RoundFocusDismissedFlag()) {
 		return;
 	}
 	const auto window = widget->window();
 	if (!window) {
 		return;
 	}
-	const auto circle = QRect(
-		widget->mapTo(window, rectInWidget.topLeft()),
-		rectInWidget.size());
+	const auto toWindow = [&](QRect r) {
+		return QRect(widget->mapTo(window, r.topLeft()), r.size());
+	};
 	if (!RoundFocusCurrent) {
 		RoundFocusCurrent = new RoundFocusOverlay(window);
 	}
-	RoundFocusCurrent->setCircle(circle);
+	RoundFocusCurrent->setCircle(
+		toWindow(circleInWidget),
+		toWindow(mediaInWidget),
+		leftPill,
+		rightPill);
 }
 
 

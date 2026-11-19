@@ -785,9 +785,22 @@ void Gif::draw(Painter &p, const PaintContext &context) const {
 			if (isRound && !paused && activeRoundPlaying) {
 				// Mogram: пока смотрим кружок, остальной экран размыт.
 				if (const auto widget = dynamic_cast<QWidget*>(p.device())) {
+					const auto padding = st::msgDateImgPadding;
+					const auto pillHeight = st::normalFont->height
+						+ 2 * padding.y();
+					const auto leftWidth = st::normalFont->width(_statusText)
+						+ 2 * padding.x();
+					const auto rightWidth = _parent->infoWidth()
+						+ 2 * padding.x();
+					const auto mapped = [&](QRect r) {
+						return p.transform().mapRect(QRectF(r)).toRect();
+					};
 					Mogram::Effects::RoundFocusUpdate(
 						widget,
-						p.transform().mapRect(QRectF(rthumb)).toRect());
+						mapped(rthumb),
+						mapped(QRect(0, 0, width(), height())),
+						QSize(leftWidth, pillHeight),
+						QSize(rightWidth, pillHeight));
 				}
 			}
 			if (_seeking) {
