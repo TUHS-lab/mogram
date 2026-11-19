@@ -310,7 +310,7 @@ QRect LayerWidget::countGeometry(int newWidth) {
 
 	// Mogram: внизу узкая полоса, контент почти доходит до низа окна, а его
 	// собственная подложка скруглена, поэтому нижние углы всё равно чистые.
-	const auto bottomRadius = style::ConvertScale(10);
+	const auto bottomRadius = style::ConvertScale(4);
 	const auto maxVisibleHeight = windowHeight - newTop;
 	// Top rounding is included in _contentWrapHeight.
 	auto desiredHeight = _contentWrapHeight + bottomRadius;

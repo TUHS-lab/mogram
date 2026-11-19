@@ -169,7 +169,9 @@ ContentWidget::ContentWidget(
 				// Карточки внизу заканчиваются скруглёнными углами, а не
 				// острыми: снаружи воображаемой карточки (поля 10 пикселей,
 				// радиус как у карточек) доливаем цвет окна.
-				if (!top) {
+				// Mogram: рамка из карточных уголков только у профиля; в списках
+				// медиа (видео, фото) плитки идут до низа без широкой рамки.
+				if (!top && _controller->section().type() == Section::Type::Profile) {
 					const auto side = 10;
 					const auto radius = style::ConvertScale(25);
 					auto outside = QPainterPath();
@@ -215,7 +217,7 @@ ContentWidget::ContentWidget(
 			const auto layer = (_controller->wrap() == Wrap::Layer);
 			const auto height = style::ConvertScale(16);
 			// Высота перехода не меньше радиуса карточки, чтобы скругление было целым.
-			const auto bottomHeight = style::ConvertScale(30);
+			const auto bottomHeight = style::ConvertScale(20);
 			const auto g = _scroll->geometry();
 			const auto profile = (_controller->section().type()
 				== Section::Type::Profile);
