@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/info_top_bar.h"
 #include "info/info_memento.h"
 #include "ui/rp_widget.h"
+#include "ui/qt_object_factory.h"
 #include "ui/focus_persister.h"
 #include "ui/widgets/buttons.h"
 #include "ui/cached_round_corners.h"
@@ -365,6 +366,38 @@ QRect LayerWidget::countGeometry(int newWidth) {
 		_contentWrap->setMask(QRegion(
 			body.united(rounded).toFillPolygon().toPolygon(),
 			Qt::WindingFill));
+		// Mogram: у маски края ступенчатые; тонкое кольцо цвета слоя со
+		// сглаживанием по нижним углам закрывает ступеньки.
+		auto ring = findChild<QWidget*>(
+			u"mog-corner-ring"_q,
+			Qt::FindDirectChildrenOnly);
+		if (!ring) {
+			const auto created = Ui::CreateChild<Ui::RpWidget>(this);
+			created->setObjectName(u"mog-corner-ring"_q);
+			created->setAttribute(Qt::WA_TransparentForMouseEvents);
+			created->paintRequest(
+			) | rpl::on_next([=] {
+				auto p = QPainter(created);
+				auto hq = PainterHighQualityEnabler(p);
+				const auto r = style::ConvertScale(28);
+				const auto in = style::ConvertScale(3);
+				const auto w = created->width();
+				const auto h = created->height();
+				auto outer = QPainterPath();
+				outer.addRoundedRect(QRectF(0, -4 * r, w, h + 4 * r), r, r);
+				auto inner = QPainterPath();
+				inner.addRoundedRect(
+					QRectF(in, -4 * r, w - 2 * in, h + 4 * r - in),
+					r - in,
+					r - in);
+				p.fillPath(outer.subtracted(inner), st::dialogsBg);
+			}, created->lifetime());
+			ring = created;
+		}
+		const auto ringHeight = style::ConvertScale(28) + style::ConvertScale(6);
+		ring->setGeometry(0, desiredHeight - ringHeight, newWidth, ringHeight);
+		ring->raise();
+		ring->show();
 		// Mogram: непрозрачные потомки оставляют чёрный клин за маской.
 		Ui::KeepDescendantsTranslucent(_contentWrap.data());
 	}
