@@ -1000,11 +1000,16 @@ private:
 		auto path = QPainterPath();
 		path.addRect(QRectF(rect()));
 		auto clear = QPainterPath();
+		// Одно правило заливки на все части: пилюли пересекаются с кружком,
+		// и при чётно-нечётном правиле в местах пересечения возникали дырки.
+		clear.setFillRule(Qt::WindingFill);
 		clear.addEllipse(QRectF(_circle).adjusted(-1, -1, 1, 1));
-		const auto radius = style::ConvertScale(8);
+		const auto radius = style::ConvertScale(9);
+		const auto side = style::ConvertScale(4);
+		const auto vert = style::ConvertScale(2);
 		for (const auto &pill : _pills) {
 			clear.addRoundedRect(
-				QRectF(pill).adjusted(-1, -1, 1, 1),
+				QRectF(pill).adjusted(-side, -vert, side, vert),
 				radius,
 				radius);
 		}
@@ -1026,6 +1031,7 @@ private:
 QPointer<RoundFocusOverlay> RoundFocusCurrent;
 crl::time RoundFocusLastCall = 0;
 crl::time RoundFocusLastPress = 0;
+crl::time RoundFocusSessionPress = 0;
 bool RoundFocusSession = false;
 
 // Размытие включается, только если кружок запущен после нажатия мыши:
@@ -1034,7 +1040,11 @@ class PressFilter final : public QObject {
 protected:
 	bool eventFilter(QObject *watched, QEvent *event) override {
 		if (event->type() == QEvent::MouseButtonPress) {
-			RoundFocusLastPress = crl::now();
+			// Нажатие на само размытие его только убирает и не запускает просмотр.
+			const auto overlay = RoundFocusCurrent.data();
+			if (!overlay || watched != overlay) {
+				RoundFocusLastPress = crl::now();
+			}
 		}
 		return false;
 	}
@@ -1064,8 +1074,17 @@ void RoundFocusUpdate(
 	}
 	const auto now = crl::now();
 	// Долгая пауза без вызовов значит, что начался новый просмотр кружка.
-	if (now - RoundFocusLastCall > 1500 || key != RoundFocusKey) {
+	// Каждое новое нажатие мыши начинает новый просмотр, даже того же кружка.
+	const auto freshPress = (RoundFocusLastPress > RoundFocusSessionPress)
+		&& (now - RoundFocusLastPress < 15000);
+	if (now - RoundFocusLastCall > 1500
+		|| key != RoundFocusKey
+		|| freshPress) {
 		RoundFocusKey = key;
+		RoundFocusSessionPress = RoundFocusLastPress;
+		if (RoundFocusCurrent && RoundFocusCurrent->dismissed()) {
+			RoundFocusCurrent = nullptr;
+		}
 		RoundFocusOverlay::RoundFocusDismissedFlag() = false;
 		RoundFocusSession = (now - RoundFocusLastPress) < 15000;
 		RoundFocusPills.clear();
