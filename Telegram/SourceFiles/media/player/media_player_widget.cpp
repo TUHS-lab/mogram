@@ -771,9 +771,9 @@ void Widget::paintEvent(QPaintEvent *e) {
 	}
 	// Mogram: обложка слева.
 	if (_type == AudioMsgId::Type::Song) {
-		const auto size = 38;
+		const auto size = 32;
 		const auto art = QRect(
-			10,
+			8,
 			(st::mediaPlayerHeight - size) / 2,
 			size,
 			size);
@@ -832,11 +832,11 @@ void Widget::paintEvent(QPaintEvent *e) {
 		}
 	} else if (const auto peer = voiceSender()) {
 		// Mogram: аватарка отправителя вместо пустоты слева у голосовых.
-		const auto size = 38;
+		const auto size = 32;
 		peer->paintUserpicLeft(
 			p,
 			_voiceUserpic,
-			10,
+			8,
 			(st::mediaPlayerHeight - size) / 2,
 			width(),
 			size);
@@ -920,7 +920,7 @@ void Widget::mouseReleaseEvent(QMouseEvent *e) {
 	// Mogram: клик по обложке открывает очередь и управление, по названию
 	// музыку с последним запросом.
 	if (_type == AudioMsgId::Type::Song) {
-		const auto cover = QRect(10, (st::mediaPlayerHeight - 38) / 2, 38, 38);
+		const auto cover = QRect(8, (st::mediaPlayerHeight - 32) / 2, 32, 32);
 		if (cover.contains(e->pos())) {
 			Mogram::Music::ShowPlayerBox(_controller);
 			return;

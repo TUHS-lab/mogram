@@ -81,12 +81,12 @@ MediaSpeedButton {
 }
 
 mediaPlayerWideWidth: 460px;
-mediaPlayerHeight: 54px;
+mediaPlayerHeight: 44px;
 mediaPlayerPadding: 8px;
-mediaPlayerNameTop: 31px;
-mediaPlayerPlayLeft: 66px;
+mediaPlayerNameTop: 26px;
+mediaPlayerPlayLeft: 54px;
 mediaPlayerPlaySkip: 1px;
-mediaPlayerPlayTop: 12px;
+mediaPlayerPlayTop: 7px;
 mediaPlayerCloseRight: 0px;
 
 mediaPlayerName: FlatLabel(defaultFlatLabel) {
