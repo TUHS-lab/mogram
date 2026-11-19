@@ -127,13 +127,13 @@ void PinnedBar::setContent(rpl::producer<Ui::MessageBarContent> content) {
 	}) | rpl::on_next_done([=](bool hidden) {
 		_shouldBeShown = !hidden;
 		if (!_forceHidden) {
-			_wrap.toggle(_shouldBeShown, anim::type::normal);
+			_wrap.toggle(_shouldBeShown, anim::type::instant); // Mogram: без анимации
 		} else if (!_shouldBeShown) {
 			_bar = nullptr;
 		}
 	}, [=] {
 		_forceHidden = true;
-		_wrap.toggle(false, anim::type::normal);
+		_wrap.toggle(false, anim::type::instant);
 	}, _contentLifetime);
 }
 
@@ -145,7 +145,7 @@ void PinnedBar::setRightButton(object_ptr<Ui::RpWidget> button) {
 		) | rpl::filter(!rpl::mappers::_1) | rpl::on_next([=] {
 			_right.previousButtonLifetime.destroy();
 		});
-		previous->hide(anim::type::normal);
+		previous->hide(anim::type::instant);
 		_right.previousButtonLifetime.make_state<Unique>(Unique{ previous });
 	}
 	_right.button.create(_wrap.entity(), std::move(button));
@@ -153,7 +153,7 @@ void PinnedBar::setRightButton(object_ptr<Ui::RpWidget> button) {
 		_right.button->setParent(_wrap.entity());
 		if (hasPrevious) {
 			_right.button->setDuration(st::defaultMessageBar.duration);
-			_right.button->show(anim::type::normal);
+			_right.button->show(anim::type::instant);
 		} else {
 			_right.button->setDuration(0);
 			_right.button->show(anim::type::instant);
