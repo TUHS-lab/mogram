@@ -6530,11 +6530,16 @@ public:
 			}
 			update();
 		});
+		connect(qApp, &QGuiApplication::applicationStateChanged, this, [=] {
+			setLoading(_loading);
+		});
 	}
 
 	void setLoading(bool loading) {
 		_loading = loading;
-		if (_loading && isVisible() && !PowerSaving::On(PowerSaving::kAnimations)) {
+		if (_loading && isVisible()
+			&& QGuiApplication::applicationState() == Qt::ApplicationActive
+			&& !PowerSaving::On(PowerSaving::kAnimations)) {
 			_clock.start();
 			_timer.start();
 		} else {
