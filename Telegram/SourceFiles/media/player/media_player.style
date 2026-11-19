@@ -81,12 +81,12 @@ MediaSpeedButton {
 }
 
 mediaPlayerWideWidth: 460px;
-mediaPlayerHeight: 72px;
+mediaPlayerHeight: 54px;
 mediaPlayerPadding: 8px;
-mediaPlayerNameTop: 42px;
-mediaPlayerPlayLeft: 82px;
+mediaPlayerNameTop: 31px;
+mediaPlayerPlayLeft: 66px;
 mediaPlayerPlaySkip: 1px;
-mediaPlayerPlayTop: 21px;
+mediaPlayerPlayTop: 12px;
 mediaPlayerCloseRight: 0px;
 
 mediaPlayerName: FlatLabel(defaultFlatLabel) {
@@ -180,7 +180,7 @@ mediaPlayerMenuCheck: icon {{ "player/player_check", mediaPlayerActiveFg }};
 mediaPlayerSpeedMenuInner: Menu(menuWithIcons) {
 	separator: MenuSeparator(defaultMenuSeparator) {
 		padding: margins(0px, 4px, 0px, 4px);
-		width: 6px;
+		width: 1px;
 	}
 	itemPadding: margins(54px, 7px, 54px, 9px);
 	itemFgDisabled: mediaPlayerActiveFg;
