@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "history/view/media/history_view_gif.h"
+#include "mogram/effects/mogram_effects.h"
 
 #include "apiwrap.h"
 #include "api/api_transcribes.h"
@@ -781,6 +782,14 @@ void Gif::draw(Painter &p, const PaintContext &context) const {
 
 			const auto frame = streamed->frameWithInfo(request);
 			p.drawImage(rthumb, frame.image);
+			if (isRound && !paused && activeRoundPlaying) {
+				// Mogram: пока смотрим кружок, остальной экран размыт.
+				if (const auto widget = dynamic_cast<QWidget*>(p.device())) {
+					Mogram::Effects::RoundFocusUpdate(
+						widget,
+						p.transform().mapRect(QRectF(rthumb)).toRect());
+				}
+			}
 			if (_seeking) {
 				_seekLastFrame = frame.image;
 			}

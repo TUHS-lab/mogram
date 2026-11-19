@@ -26,6 +26,11 @@ void WallpaperAttach(not_null<QWidget*> widget);
 // Короткая заставка при первом показе окна: знак проявляется и растворяется.
 void PlayStartup(not_null<QWidget*> host);
 
+// Пока играет кружок, остальной экран размыт (если включено в настройках).
+// Зовётся при каждой отрисовке кружка: widget это то, на чём он нарисован,
+// rectInWidget это квадрат кружка в его координатах.
+void RoundFocusUpdate(not_null<QWidget*> widget, QRect rectInWidget);
+
 // Сообщение в rectInSource (координаты source) рассыпается поверх host.
 void PlayDelete(
 	not_null<QWidget*> host,

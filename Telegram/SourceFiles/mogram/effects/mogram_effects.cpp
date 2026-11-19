@@ -21,6 +21,8 @@
 
 #include <QtCore/QFileInfo>
 #include <QtCore/QPointer>
+#include <QtCore/QTimer>
+#include <QtGui/QRegion>
 #include <QtCore/QRandomGenerator>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QPixmap>
@@ -651,6 +653,13 @@ void RegisterSettings() {
 	});
 
 	add({
+		.key = u"fx.round_focus"_q,
+		.title = U(Mogram::Lang::Tr("Размывать экран при просмотре кружка")),
+		.description = U(Mogram::Lang::Tr("Пока играет кружок, всё остальное в окне размыто и затемнено.")),
+		.kind = S::Kind::Bool,
+		.defaultValue = false,
+	}, U(Mogram::Lang::Tr("Кружки")), "palette");
+	add({
 		.key = u"fx.startup.enabled"_q,
 		.title = U(Mogram::Lang::Tr("Заставка при запуске")),
 		.description = U(Mogram::Lang::Tr("Знак Mogram проявляется и растворяется при открытии окна.")),
@@ -881,6 +890,110 @@ void PlayStartup(not_null<QWidget*> host) {
 		return;
 	}
 	Ui::CreateChild<StartupOverlay>(host.get());
+}
+
+
+namespace {
+
+// Mogram: размытие всего окна, кроме играющего кружка. Снимок окна берётся один раз
+// при начале воспроизведения, поверх него полупрозрачная тень; квадрат кружка вырезан
+// маской, поэтому видео под ним продолжает идти. Пропал вызов (кружок остановили, ушёл
+// с экрана) через четверть секунды слой убирается.
+class RoundFocusOverlay final : public QWidget {
+public:
+	explicit RoundFocusOverlay(not_null<QWidget*> window)
+	: QWidget(window)
+	, _window(window) {
+		setAttribute(Qt::WA_TransparentForMouseEvents);
+		setAttribute(Qt::WA_NoSystemBackground);
+		_expire.setSingleShot(true);
+		_expire.setInterval(250);
+		connect(&_expire, &QTimer::timeout, this, [=] { deleteLater(); });
+	}
+
+	void setCircle(QRect circleInWindow) {
+		if (_capturing) {
+			return;
+		}
+		_expire.start();
+		if (_ready && _circle == circleInWindow && size() == _window->size()) {
+			return;
+		}
+		_circle = circleInWindow;
+		if (!_ready || size() != _window->size()) {
+			capture();
+		}
+		updateMask();
+	}
+
+protected:
+	void paintEvent(QPaintEvent *e) override {
+		auto p = QPainter(this);
+		if (!_blurred.isNull()) {
+			p.drawPixmap(rect(), _blurred);
+		}
+		p.fillRect(rect(), QColor(0, 0, 0, 90));
+	}
+
+private:
+	void capture() {
+		_capturing = true;
+		hide();
+		const auto shot = _window->grab();
+		_capturing = false;
+		setGeometry(_window->rect());
+		// Сжатие и растяжение со сглаживанием даёт сильное размытие без тяжёлой свёртки.
+		const auto small = shot.scaled(
+			std::max(shot.width() / 12, 1),
+			std::max(shot.height() / 12, 1),
+			Qt::IgnoreAspectRatio,
+			Qt::SmoothTransformation);
+		_blurred = small.scaled(
+			shot.size(),
+			Qt::IgnoreAspectRatio,
+			Qt::SmoothTransformation);
+		_ready = true;
+		show();
+		raise();
+	}
+
+	void updateMask() {
+		auto region = QRegion(rect());
+		const auto pad = style::ConvertScale(1);
+		region -= QRegion(
+			_circle.adjusted(-pad, -pad, pad, pad),
+			QRegion::Ellipse);
+		setMask(region);
+	}
+
+	const not_null<QWidget*> _window;
+	QPixmap _blurred;
+	QRect _circle;
+	QTimer _expire;
+	bool _ready = false;
+	bool _capturing = false;
+
+};
+
+QPointer<RoundFocusOverlay> RoundFocusCurrent;
+
+} // namespace
+
+void RoundFocusUpdate(not_null<QWidget*> widget, QRect rectInWidget) {
+	if (!S::Bool(u"fx.round_focus"_q) || rectInWidget.isEmpty()) {
+		return;
+	}
+	const auto window = widget->window();
+	if (!window) {
+		return;
+	}
+	const auto circle = QRect(
+		widget->mapTo(window, rectInWidget.topLeft()),
+		rectInWidget.size());
+	if (!RoundFocusCurrent) {
+		RoundFocusCurrent = new RoundFocusOverlay(window);
+	}
+	RoundFocusCurrent->setCircle(circle);
 }
 
 

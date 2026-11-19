@@ -402,6 +402,7 @@ struct Category {
 		{ "commands.enabled", "▶️" },
 		{ "documents.pdf", "📄" },
 		{ "fx.delete.enabled", "🗑" },
+		{ "fx.round_focus", "⭕️" },
 		{ "fx.delete.color", "🔵" },
 		{ "fx.delete.duration", "⏳" },
 		{ "fx.delete.max_particles", "#️⃣" },
