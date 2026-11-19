@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "history/view/history_view_message.h"
+#include "mogram/effects/mogram_effects.h"
 
 #include "mogram/scam/mogram_scam.h"
 
@@ -5494,6 +5495,9 @@ void Message::drawInfo(
 		const auto dateW = size.width() + 2 * st::msgDateImgPadding.x();
 		const auto dateH = size.height() + 2 * st::msgDateImgPadding.y();
 		Ui::FillRoundRect(p, dateX - st::msgDateImgPadding.x(), dateY - st::msgDateImgPadding.y(), dateW, dateH, sti->msgServiceBg, sti->msgServiceBgCornersSmall);
+		Mogram::Effects::RoundFocusPill( // Mogram: чистая зона кружка
+			p,
+			QRect(dateX - st::msgDateImgPadding.x(), dateY - st::msgDateImgPadding.y(), dateW, dateH));
 	}
 	_bottomInfo.paint(
 		p,

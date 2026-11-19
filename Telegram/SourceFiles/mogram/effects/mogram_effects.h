@@ -29,14 +29,13 @@ void PlayStartup(not_null<QWidget*> host);
 // Пока играет кружок, остальной экран размыт (если включено в настройках).
 // Зовётся при каждой отрисовке кружка: widget это то, на чём он нарисован,
 // rectInWidget это квадрат кружка в его координатах.
-// media это весь прямоугольник сообщения, leftPill и rightPill размеры пилюль
-// (длительность слева, время справа): только они и кружок остаются чёткими.
+// Только кружок и две его пилюли (длительность, время) остаются чёткими.
+// Пилюли сообщают о себе сами в момент рисования через RoundFocusPill.
 void RoundFocusUpdate(
 	not_null<QWidget*> widget,
 	QRect circleInWidget,
-	QRect mediaInWidget,
-	QSize leftPill,
-	QSize rightPill);
+	uint64 key);
+void RoundFocusPill(QPainter &p, QRect rect);
 
 // Сообщение в rectInSource (координаты source) рассыпается поверх host.
 void PlayDelete(

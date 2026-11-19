@@ -785,22 +785,11 @@ void Gif::draw(Painter &p, const PaintContext &context) const {
 			if (isRound && !paused && activeRoundPlaying) {
 				// Mogram: пока смотрим кружок, остальной экран размыт.
 				if (const auto widget = dynamic_cast<QWidget*>(p.device())) {
-					const auto padding = st::msgDateImgPadding;
-					const auto pillHeight = st::normalFont->height
-						+ 2 * padding.y();
-					const auto leftWidth = st::normalFont->width(_statusText)
-						+ 2 * padding.x();
-					const auto rightWidth = _parent->infoWidth()
-						+ 2 * padding.x();
-					const auto mapped = [&](QRect r) {
-						return p.transform().mapRect(QRectF(r)).toRect();
-					};
 					Mogram::Effects::RoundFocusUpdate(
 						widget,
-						mapped(rthumb),
-						mapped(QRect(0, 0, width(), height())),
-						QSize(leftWidth, pillHeight),
-						QSize(rightWidth, pillHeight));
+						p.transform().mapRect(QRectF(rthumb)).toRect(),
+						uint64(item->fullId().msg.bare)
+							^ (uint64(item->fullId().peer.value) << 1));
 				}
 			}
 			if (_seeking) {
@@ -978,6 +967,9 @@ void Gif::draw(Painter &p, const PaintContext &context) const {
 				statusW += st::mediaUnreadSkip + st::mediaUnreadSize;
 			}
 			Ui::FillRoundRect(p, style::rtlrect(statusX - st::msgDateImgPadding.x(), statusY - st::msgDateImgPadding.y(), statusW, statusH, width()), sti->msgServiceBg, sti->msgServiceBgCornersSmall);
+			Mogram::Effects::RoundFocusPill( // Mogram
+				p,
+				style::rtlrect(statusX - st::msgDateImgPadding.x(), statusY - st::msgDateImgPadding.y(), statusW, statusH, width()));
 			p.setFont(st::normalFont);
 			p.setPen(st->msgServiceFg());
 			p.drawTextLeft(statusX, statusY, width(), statusText, statusW - 2 * st::msgDateImgPadding.x());

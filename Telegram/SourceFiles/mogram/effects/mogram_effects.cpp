@@ -916,17 +916,12 @@ public:
 		connect(&_expire, &QTimer::timeout, this, [=] { deleteLater(); });
 	}
 
-	void setCircle(
-			QRect circleInWindow,
-			QRect mediaInWindow,
-			QSize leftPill,
-			QSize rightPill) {
+	void setCircle(QRect circleInWindow, std::vector<QRect> pills) {
 		if (_capturing) {
 			return;
 		}
-		_media = mediaInWindow;
-		_leftPill = leftPill;
-		_rightPill = rightPill;
+		const auto pillsChanged = (_pills != pills);
+		_pills = std::move(pills);
 		_expire.start();
 		const auto similar = [](int a, int b) {
 			return std::abs(a - b) <= 2;
@@ -937,12 +932,10 @@ public:
 			&& similar(_circle.y(), circleInWindow.y())
 			&& similar(_circle.width(), circleInWindow.width())
 			&& similar(_circle.height(), circleInWindow.height())
-			&& similar(_mediaMask.x(), mediaInWindow.x())
-			&& similar(_mediaMask.y(), mediaInWindow.y())) {
+			&& !pillsChanged) {
 			return;
 		}
 		_circle = circleInWindow;
-		_mediaMask = mediaInWindow;
 		if (!_ready || size() != _window->size()) {
 			capture();
 		}
@@ -1002,38 +995,18 @@ private:
 	}
 
 	void updateMask() {
-		// Чисто остаются только кружок и две пилюли точно по их размеру (длительность
-		// слева, время справа). Всё остальное, и фон за пилюлями, размыто.
-		const auto c = _circle;
-		const auto m = _media.isEmpty() ? c : _media;
-		const auto gap = style::ConvertScale(4);
+		// Чисто остаются кружок и его пилюли ровно по их размеру, всё остальное
+		// размыто (в том числе фон за пилюлями).
 		auto path = QPainterPath();
 		path.addRect(QRectF(rect()));
 		auto clear = QPainterPath();
-		clear.addEllipse(QRectF(c).adjusted(-1, -1, 1, 1));
-		// Запас вокруг пилюли: цифры не должны обрезаться.
-		const auto grow = [&](QRectF r) {
-			const auto side = style::ConvertScale(8);
-			const auto vert = style::ConvertScale(4);
-			return r.adjusted(-side, -vert, side, vert);
-		};
-		const auto addPill = [&](QRectF r) {
-			const auto radius = r.height() / 2.;
-			clear.addRoundedRect(r, radius, radius);
-		};
-		if (!_leftPill.isEmpty()) {
-			addPill(grow(QRectF(
-				m.left() + gap,
-				m.bottom() - gap - _leftPill.height(),
-				_leftPill.width(),
-				_leftPill.height())));
-		}
-		if (!_rightPill.isEmpty()) {
-			addPill(grow(QRectF(
-				m.right() - gap - _rightPill.width(),
-				m.bottom() - gap - _rightPill.height(),
-				_rightPill.width(),
-				_rightPill.height())));
+		clear.addEllipse(QRectF(_circle).adjusted(-1, -1, 1, 1));
+		const auto radius = style::ConvertScale(8);
+		for (const auto &pill : _pills) {
+			clear.addRoundedRect(
+				QRectF(pill).adjusted(-1, -1, 1, 1),
+				radius,
+				radius);
 		}
 		setMask(QRegion(path.subtracted(clear).toFillPolygon().toPolygon()));
 	}
@@ -1041,10 +1014,7 @@ private:
 	const not_null<QWidget*> _window;
 	QPixmap _blurred;
 	QRect _circle;
-	QRect _mediaMask;
-	QRect _media;
-	QSize _leftPill;
-	QSize _rightPill;
+	std::vector<QRect> _pills;
 	QTimer _expire;
 	bool _ready = false;
 	bool _capturing = false;
@@ -1078,22 +1048,36 @@ void InstallRoundFocusFilter() {
 	qApp->installEventFilter(filter);
 }
 
+std::vector<QRect> RoundFocusPills;
+std::vector<QRect> RoundFocusPending;
+bool RoundFocusRecording = false;
+crl::time RoundFocusRecordingStart = 0;
+
+uint64 RoundFocusKey = 0;
+
 void RoundFocusUpdate(
 		not_null<QWidget*> widget,
 		QRect circleInWidget,
-		QRect mediaInWidget,
-		QSize leftPill,
-		QSize rightPill) {
+		uint64 key) {
 	if (!S::Bool(u"fx.round_focus"_q) || circleInWidget.isEmpty()) {
 		return;
 	}
 	const auto now = crl::now();
 	// Долгая пауза без вызовов значит, что начался новый просмотр кружка.
-	if (now - RoundFocusLastCall > 1500) {
+	if (now - RoundFocusLastCall > 1500 || key != RoundFocusKey) {
+		RoundFocusKey = key;
 		RoundFocusOverlay::RoundFocusDismissedFlag() = false;
 		RoundFocusSession = (now - RoundFocusLastPress) < 15000;
+		RoundFocusPills.clear();
+		RoundFocusPending.clear();
 	}
 	RoundFocusLastCall = now;
+	// Пилюли, нарисованные в прошлом кадре, станут чистой зоной в этом;
+	// новые соберутся, пока рисуется текущий кадр.
+	RoundFocusPills = std::move(RoundFocusPending);
+	RoundFocusPending.clear();
+	RoundFocusRecording = true;
+	RoundFocusRecordingStart = now;
 	if (!RoundFocusSession
 		|| RoundFocusOverlay::RoundFocusDismissedFlag()) {
 		return;
@@ -1102,17 +1086,37 @@ void RoundFocusUpdate(
 	if (!window) {
 		return;
 	}
-	const auto toWindow = [&](QRect r) {
-		return QRect(widget->mapTo(window, r.topLeft()), r.size());
-	};
 	if (!RoundFocusCurrent) {
 		RoundFocusCurrent = new RoundFocusOverlay(window);
 	}
 	RoundFocusCurrent->setCircle(
-		toWindow(circleInWidget),
-		toWindow(mediaInWidget),
-		leftPill,
-		rightPill);
+		QRect(
+			widget->mapTo(window, circleInWidget.topLeft()),
+			circleInWidget.size()),
+		RoundFocusPills);
+}
+
+void RoundFocusPill(QPainter &p, QRect rect) {
+	// Только пилюли того кружка, который рисуется прямо сейчас.
+	if (!RoundFocusRecording
+		|| crl::now() - RoundFocusRecordingStart > 12) {
+		RoundFocusRecording = false;
+		return;
+	}
+	const auto widget = dynamic_cast<QWidget*>(p.device());
+	if (!widget) {
+		return;
+	}
+	const auto window = widget->window();
+	if (!window) {
+		return;
+	}
+	const auto mapped = p.transform().mapRect(QRectF(rect)).toRect();
+	RoundFocusPending.push_back(
+		QRect(widget->mapTo(window, mapped.topLeft()), mapped.size()));
+	if (RoundFocusPending.size() >= 2) {
+		RoundFocusRecording = false;
+	}
 }
 
 
