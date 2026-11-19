@@ -6741,8 +6741,8 @@ public:
 			scheduleHomeMoreIfNeeded();
 		});
 		_tabScroll->scrollTopChanges() | rpl::on_next([=](int top) {
-			_topFade->setVisible(_tab != Tab::Now
-				&& ((_tab != Tab::Search && _tab != Tab::Library && _tab != Tab::Queue) || top > 0));
+			_topFade->setVisible((_tab != Tab::Now || showsQueue())
+				&& ((_tab != Tab::Search && _tab != Tab::Library && !showsQueue()) || top > 0));
 			_topFade->update();
 			_bottomFade->update();
 			if (_tab == Tab::Home && _homeAlbumOpen) {
@@ -6860,7 +6860,7 @@ public:
 		_kindSwitch->hide();
 		QueueState().changes.events(
 		) | rpl::on_next([=] {
-			if (_tab == Tab::Queue) {
+			if (showsQueue()) {
 				rebuildTab();
 			}
 		}, lifetime());
@@ -7245,6 +7245,9 @@ protected:
 		int controlsWidth = 0;
 		int controlsTop = 0;
 	};
+	[[nodiscard]] bool showsQueue() const {
+		return _tab == Tab::Queue || (_tab == Tab::Now && _lyricsMissing);
+	}
 	[[nodiscard]] Layout computeLayout() const {
 		const auto s = [](int v) { return style::ConvertScale(v); };
 		auto result = Layout();
@@ -7305,6 +7308,10 @@ protected:
 				top,
 				std::max(width() - margin - lyricsLeft, 0),
 				areaHeight);
+			if (showsQueue()) {
+				result.center = result.lyrics;
+				result.scrollTop = result.center.y();
+			}
 		} else {
 			const auto contentWidth = std::max(width() - ((_tab == Tab::Home && _homeArtistOpen) ? 0 : 2 * margin), 0);
 			result.center = QRect((width() - contentWidth) / 2, top, contentWidth, areaHeight);
@@ -7474,9 +7481,9 @@ protected:
 			_volume->setGeometry(layout.volume);
 		}
 		_seek->setGeometry(layout.seek);
-		_view->setVisible(_tab == Tab::Now);
+		_view->setVisible(_tab == Tab::Now && !showsQueue());
 		_view->setGeometry(layout.lyrics);
-		_tabScroll->setVisible(_tab != Tab::Now);
+		_tabScroll->setVisible(_tab != Tab::Now || showsQueue());
 		_tabScroll->setGeometry(
 			layout.center.x(),
 			layout.scrollTop,
@@ -7484,12 +7491,12 @@ protected:
 			std::max(layout.center.y() + layout.center.height() - layout.scrollTop - s(12), 0));
 		_tabList->resizeToWidth(_tabScroll->width());
 		if (_homeAlbumHeader) _homeAlbumHeader->setBannerTopInset(_tabScroll->y());
-		_topFade->setVisible(_tab != Tab::Now
-			&& ((_tab != Tab::Search && _tab != Tab::Library && _tab != Tab::Queue) || _tabScroll->scrollTop() > 0));
+		_topFade->setVisible((_tab != Tab::Now || showsQueue())
+			&& ((_tab != Tab::Search && _tab != Tab::Library && !showsQueue()) || _tabScroll->scrollTop() > 0));
 		_topFade->setGeometry(
 			_tabScroll->x(), _tabScroll->y(), _tabScroll->width(), s(28));
 		_topFade->raise();
-		_bottomFade->setVisible(_tab != Tab::Now);
+		_bottomFade->setVisible(_tab != Tab::Now || showsQueue());
 		_bottomFade->setGeometry(
 			_tabScroll->x(),
 			_tabScroll->y() + _tabScroll->height() - s(36),
@@ -8265,6 +8272,9 @@ protected:
 		};
 		switch (_tab) {
 		case Tab::Now:
+			if (showsQueue()) {
+				fillQueue();
+			}
 			break;
 		case Tab::Home: {
 			const auto &queue = QueueState();
@@ -8690,7 +8700,7 @@ protected:
 			}
 		}
 		_tabList->resizeToWidth(_tabScroll->width());
-		if (_tab != Tab::Queue) {
+		if (!showsQueue()) {
 			_tabScroll->scrollToY(keep);
 		}
 		update();
@@ -8713,7 +8723,7 @@ protected:
 						session,
 						crl::guard(this, [=](std::vector<Track> list, QString) {
 							ContextTracks() = std::move(list);
-							if (_tab == Tab::Queue) {
+							if (showsQueue()) {
 								rebuildTab();
 							}
 						}),
@@ -8833,9 +8843,9 @@ protected:
 		};
 
 		// Открытая вкладка лежит на карточке; на «Сейчас играет» обложка и текст прямо на фоне.
-		if (_tab != Tab::Now && !(_tab == Tab::Home && _homeAlbumOpen)) {
+		if ((_tab != Tab::Now || showsQueue()) && !(_tab == Tab::Home && _homeAlbumOpen)) {
 			if (_tab != Tab::Home && _tab != Tab::Library
-				&& _tab != Tab::Playlists && _tab != Tab::Search && _tab != Tab::Queue) {
+				&& _tab != Tab::Playlists && _tab != Tab::Search && !showsQueue()) {
 				p.setFont(labelFont(19, true));
 				p.setPen(Qt::white);
 				p.drawText(
@@ -9395,12 +9405,16 @@ private:
 		_view->setPosition(state.position * 1000 / frequency, playing);
 		if (_queueFor != track.id) {
 			_queueFor = track.id;
-			if (_tab == Tab::Queue) {
+			if (showsQueue()) {
 				rebuildTab();
 			}
 		}
 		if (_lyricsFor != track.id) {
 			_lyricsFor = track.id;
+			if (std::exchange(_lyricsMissing, false) && _tab == Tab::Now) {
+				relayout();
+				rebuildTab();
+			}
 			_view->setCommentsTrack(QString());
 			ResolveCommentsTrack(track, crl::guard(this, [=, id = track.id](QString sc) {
 				if (_lyricsFor == id) _view->setCommentsTrack(sc);
@@ -9414,7 +9428,12 @@ private:
 				track.durationMs,
 				crl::guard(this, [=](Lyrics lyrics) {
 					if (_lyricsFor == id) {
+						_lyricsMissing = !lyrics.found || lyrics.lines.empty();
 						_view->setLyrics(std::move(lyrics));
+						if (_tab == Tab::Now) {
+							relayout();
+							rebuildTab();
+						}
 					}
 				}));
 		}
@@ -9492,6 +9511,7 @@ private:
 	QString _searchStatus;
 	int _searchGen = 0;
 	bool _searchChats = false;
+	bool _lyricsMissing = false;
 	Tab _tab = Tab::Now;
 	Tab _rebuiltTab = Tab::Queue;
 	bool _librarySyncLoading = false;
