@@ -14,6 +14,7 @@
 #include "core/application.h"
 #include "window/window_controller.h"
 #include "core/file_utilities.h"
+#include "ui/image/image_prepare.h"
 #include "ui/painter.h"
 #include "ui/power_saving.h"
 #include "ui/rp_widget.h"
@@ -23,6 +24,7 @@
 #include <QtCore/QPointer>
 #include <QtCore/QTimer>
 #include <QtGui/QRegion>
+#include <QtGui/QMouseEvent>
 #include <QtCore/QRandomGenerator>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QPixmap>
@@ -896,18 +898,18 @@ void PlayStartup(not_null<QWidget*> host) {
 namespace {
 
 // Mogram: размытие всего окна, кроме играющего кружка. Снимок окна берётся один раз
-// при начале воспроизведения, поверх него полупрозрачная тень; квадрат кружка вырезан
-// маской, поэтому видео под ним продолжает идти. Пропал вызов (кружок остановили, ушёл
-// с экрана) через четверть секунды слой убирается.
+// при начале воспроизведения и размывается; поверх него лёгкая тень. Вокруг кружка
+// остаётся чистое окно (с запасом: время и подпись видны). Клик по размытию убирает
+// слой до следующего кружка. Пока кружок рисуется, слой держится; если вызовов нет
+// больше полутора секунд (кружок остановили или окно ушло с экрана), он убирается.
 class RoundFocusOverlay final : public QWidget {
 public:
 	explicit RoundFocusOverlay(not_null<QWidget*> window)
 	: QWidget(window)
 	, _window(window) {
-		setAttribute(Qt::WA_TransparentForMouseEvents);
-		setAttribute(Qt::WA_NoSystemBackground);
+		setCursor(Qt::ArrowCursor);
 		_expire.setSingleShot(true);
-		_expire.setInterval(250);
+		_expire.setInterval(1500);
 		connect(&_expire, &QTimer::timeout, this, [=] { deleteLater(); });
 	}
 
@@ -926,44 +928,65 @@ public:
 		updateMask();
 	}
 
+	[[nodiscard]] bool dismissed() const {
+		return _dismissed;
+	}
+
 protected:
 	void paintEvent(QPaintEvent *e) override {
 		auto p = QPainter(this);
 		if (!_blurred.isNull()) {
 			p.drawPixmap(rect(), _blurred);
 		}
-		p.fillRect(rect(), QColor(0, 0, 0, 90));
+		p.fillRect(rect(), QColor(0, 0, 0, 56));
+	}
+
+	void mousePressEvent(QMouseEvent *e) override {
+		_dismissed = true;
+		RoundFocusDismissedFlag() = true;
+		hide();
+		deleteLater();
+	}
+
+public:
+	[[nodiscard]] static bool &RoundFocusDismissedFlag() {
+		static auto value = false;
+		return value;
 	}
 
 private:
 	void capture() {
 		_capturing = true;
 		hide();
-		const auto shot = _window->grab();
+		const auto shot = _window->grab().toImage();
 		_capturing = false;
 		setGeometry(_window->rect());
-		// Сжатие и растяжение со сглаживанием даёт сильное размытие без тяжёлой свёртки.
-		const auto small = shot.scaled(
-			std::max(shot.width() / 12, 1),
-			std::max(shot.height() / 12, 1),
+		// Размытие на уменьшенной копии: мягкое и дешёвое, затем растяжение со сглаживанием.
+		auto small = shot.scaled(
+			std::max(shot.width() / 5, 1),
+			std::max(shot.height() / 5, 1),
 			Qt::IgnoreAspectRatio,
 			Qt::SmoothTransformation);
-		_blurred = small.scaled(
+		small = Images::BlurLargeImage(std::move(small), 14);
+		_blurred = QPixmap::fromImage(small.scaled(
 			shot.size(),
 			Qt::IgnoreAspectRatio,
-			Qt::SmoothTransformation);
+			Qt::SmoothTransformation));
+		_blurred.setDevicePixelRatio(shot.devicePixelRatio());
 		_ready = true;
 		show();
 		raise();
 	}
 
 	void updateMask() {
-		auto region = QRegion(rect());
-		const auto pad = style::ConvertScale(1);
-		region -= QRegion(
-			_circle.adjusted(-pad, -pad, pad, pad),
-			QRegion::Ellipse);
-		setMask(region);
+		// Окно без маски вокруг кружка: запас, чтобы время и подпись не терялись.
+		const auto pad = style::ConvertScale(28);
+		const auto hole = _circle.adjusted(-pad, -pad, pad, pad);
+		auto path = QPainterPath();
+		path.addRect(QRectF(rect()));
+		auto cut = QPainterPath();
+		cut.addRoundedRect(QRectF(hole), pad, pad);
+		setMask(QRegion(path.subtracted(cut).toFillPolygon().toPolygon()));
 	}
 
 	const not_null<QWidget*> _window;
@@ -972,15 +995,26 @@ private:
 	QTimer _expire;
 	bool _ready = false;
 	bool _capturing = false;
+	bool _dismissed = false;
 
 };
 
 QPointer<RoundFocusOverlay> RoundFocusCurrent;
+crl::time RoundFocusLastCall = 0;
 
 } // namespace
 
 void RoundFocusUpdate(not_null<QWidget*> widget, QRect rectInWidget) {
 	if (!S::Bool(u"fx.round_focus"_q) || rectInWidget.isEmpty()) {
+		return;
+	}
+	const auto now = crl::now();
+	// Долгая пауза без вызовов значит, что это уже другой просмотр кружка.
+	if (now - RoundFocusLastCall > 1500) {
+		RoundFocusOverlay::RoundFocusDismissedFlag() = false;
+	}
+	RoundFocusLastCall = now;
+	if (RoundFocusOverlay::RoundFocusDismissedFlag()) {
 		return;
 	}
 	const auto window = widget->window();
