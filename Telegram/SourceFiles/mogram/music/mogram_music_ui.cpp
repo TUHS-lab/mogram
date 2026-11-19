@@ -9361,20 +9361,10 @@ private:
 		};
 		const auto now = fmt(state.position / frequency);
 		const auto total = fmt(state.length / frequency);
-		const auto nowChanged = (_timeNow != now);
-		const auto totalChanged = (_timeTotal != total);
-		if (nowChanged || totalChanged) {
+		if (_timeNow != now || _timeTotal != total) {
 			_timeNow = now;
 			_timeTotal = total;
-			const auto layout = computeLayout();
-			auto dirty = QRegion();
-			if (nowChanged) dirty += layout.timeNow;
-			if (totalChanged) dirty += layout.timeTotal;
-			if (_tab == Tab::Home) {
-				_playbackBar->update(dirty.translated(-_playbackBar->pos()));
-			} else {
-				update(dirty);
-			}
+			update();
 		}
 		_view->setPosition(state.position * 1000 / frequency, playing);
 		if (_queueFor != track.id) {
