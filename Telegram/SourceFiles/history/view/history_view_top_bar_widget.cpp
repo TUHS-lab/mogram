@@ -610,8 +610,11 @@ void TopBarWidget::paintEvent(QPaintEvent *e) {
 			path.arcTo(QRectF(0, h - 2 * r, 2 * r, 2 * r), 270, -90);
 			path.closeSubpath();
 			p.drawPath(path);
-		} else if (stripBelow || neighbor) {
-			// Над закрепом нижний край шапки ровный, без уголка.
+		} else if (stripBelow
+				|| neighbor
+				|| (_activeChat.section != Section::History)) {
+			// Над закрепом и в разделах (комментарии, закреплённые, отложенные)
+			// нижний край шапки ровный, без уголков.
 			p.drawRect(QRectF(0, 0, width(), st::topBarHeight));
 		} else {
 			// Без закрепа оба нижних угла скруглены по краям самой шапки.
