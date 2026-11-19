@@ -423,7 +423,7 @@ void MediaSlider::paintEvent(QPaintEvent *e) {
 		if (animate && !_waveAnimation.animating()) _waveAnimation.start();
 		else if (!animate) _waveAnimation.stop();
 		const auto y = height() / 2.;
-		const auto phase = animate ? crl::now() / 500. : 0.;
+		const auto phase = animate ? crl::now() / 200. : 0.;
 		const auto stroke = std::max(_st.width, st::lineWidth);
 		const auto amplitude = animate
 			? std::max(0., std::min(double(st::motionWaveAmplitude), (height() - stroke) / 2.))
