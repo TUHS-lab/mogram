@@ -73,8 +73,10 @@ PinnedBar::PinnedBar(
 				QRect(0, bar->height() - 22, bar->width(), 22),
 				st::topBarBg->c.darker(175));
 		}
-		// Mogram: ровная плашка, без прозрачных углов по краям.
-		p.drawRect(QRectF(bar->rect()));
+		p.drawRoundedRect(
+			QRectF(bar->rect()).adjusted(0, -22, 0, 0),
+			22,
+			22);
 	}, lifetime());
 
 	if (customEmojiPausedChanges) {
