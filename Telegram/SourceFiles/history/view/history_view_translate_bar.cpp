@@ -289,10 +289,8 @@ void TranslateBar::setup(not_null<History*> history) {
 		auto hq = PainterHighQualityEnabler(p);
 		p.setPen(Qt::NoPen);
 		p.setBrush(st::topBarBg->c.darker(175));
-		p.drawRoundedRect(
-			QRectF(button->rect()).adjusted(0, -22, 0, 0),
-			22,
-			22);
+		// Mogram: ровная плашка, без прозрачных углов.
+		p.drawRect(QRectF(button->rect()));
 	}, button->lifetime());
 
 	button->setClickedCallback([=] {

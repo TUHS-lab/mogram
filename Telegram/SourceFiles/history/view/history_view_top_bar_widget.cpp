@@ -617,11 +617,9 @@ void TopBarWidget::paintEvent(QPaintEvent *e) {
 			// нижний край шапки ровный, без уголков.
 			p.drawRect(QRectF(0, 0, width(), st::topBarHeight));
 		} else {
-			// Без закрепа оба нижних угла скруглены по краям самой шапки.
-			p.drawRoundedRect(
-				QRectF(0, -22, width(), st::topBarHeight + 22),
-				22,
-				22);
+			// Без закрепа нижний край ровный: скруглённые углы давали
+			// прозрачные клинья по краям шапки.
+			p.drawRect(QRectF(0, 0, width(), st::topBarHeight));
 		}
 	}
 	if (slidingTop < 0) {
