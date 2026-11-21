@@ -951,10 +951,9 @@ protected:
 	void paintEvent(QPaintEvent *e) override {
 		auto p = QPainter(this);
 		p.setOpacity(_fade.value(1.));
-		if (!_blurred.isNull()) {
-			p.drawPixmap(rect(), _blurred);
+		if (!_layer.isNull()) {
+			p.drawPixmap(rect(), _layer);
 		}
-		p.fillRect(rect(), QColor(0, 0, 0, 56));
 	}
 
 	void mousePressEvent(QMouseEvent *e) override {
@@ -996,27 +995,58 @@ private:
 	}
 
 	void updateMask() {
-		// Чисто остаются кружок и его пилюли ровно по их размеру, всё остальное
-		// размыто (в том числе фон за пилюлями).
+		// Чисто остаются кружок и его пилюли ровно по их размеру. Слой рисуется
+		// со сглаживанием по точному контуру, а маска окна (она без сглаживания)
+		// отступает внутрь на пиксель, чтобы край кружка не был ступенчатым.
+		const auto radius = style::ConvertScale(8);
+		const auto build = [&](qreal inset) {
+			auto clear = QPainterPath();
+			clear.setFillRule(Qt::WindingFill);
+			clear.addEllipse(QRectF(_circle).adjusted(
+				inset,
+				inset,
+				-inset,
+				-inset));
+			for (const auto &pill : _pills) {
+				clear.addRoundedRect(
+					QRectF(pill).adjusted(inset, inset, -inset, -inset),
+					radius,
+					radius);
+			}
+			return clear;
+		};
 		auto path = QPainterPath();
 		path.addRect(QRectF(rect()));
-		auto clear = QPainterPath();
-		// Одно правило заливки на все части: пилюли пересекаются с кружком,
-		// и при чётно-нечётном правиле в местах пересечения возникали дырки.
-		clear.setFillRule(Qt::WindingFill);
-		clear.addEllipse(QRectF(_circle));
-		const auto radius = style::ConvertScale(8);
-		for (const auto &pill : _pills) {
-			clear.addRoundedRect(
-				QRectF(pill),
-				radius,
-				radius);
+		setMask(QRegion(path.subtracted(build(1.)).toFillPolygon().toPolygon()));
+
+		if (_blurred.isNull()) {
+			return;
 		}
-		setMask(QRegion(path.subtracted(clear).toFillPolygon().toPolygon()));
+		const auto ratio = _blurred.devicePixelRatio();
+		auto layer = QImage(
+			_blurred.size(),
+			QImage::Format_ARGB32_Premultiplied);
+		layer.setDevicePixelRatio(ratio);
+		layer.fill(Qt::transparent);
+		{
+			auto q = QPainter(&layer);
+			q.drawPixmap(
+				QRectF(QPointF(), QSizeF(_blurred.size()) / ratio),
+				_blurred,
+				QRectF(QPointF(), QSizeF(_blurred.size())));
+			q.fillRect(
+				QRectF(QPointF(), QSizeF(_blurred.size()) / ratio),
+				QColor(0, 0, 0, 56));
+			q.setRenderHint(QPainter::Antialiasing);
+			q.setCompositionMode(QPainter::CompositionMode_DestinationOut);
+			q.fillPath(build(0.), Qt::black);
+		}
+		_layer = QPixmap::fromImage(std::move(layer));
 	}
 
 	const not_null<QWidget*> _window;
 	QPixmap _blurred;
+	QPixmap _layer;
 	QRect _circle;
 	std::vector<QRect> _pills;
 	QTimer _expire;
