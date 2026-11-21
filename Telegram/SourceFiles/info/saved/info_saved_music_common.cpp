@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/saved/info_saved_music_common.h"
 
 #include "data/data_peer.h"
+#include "data/data_session.h"
 #include "data/data_saved_music.h"
 #include "data/data_saved_sublist.h"
 #include "history/history_item.h"
@@ -38,13 +39,24 @@ void SetupSavedMusic(
 		not_null<PeerData*> peer,
 		rpl::producer<std::optional<QColor>> topBarColor) {
 	auto musicValue = Data::SavedMusic::Supported(peer->id)
-		? Data::SavedMusicList(
+		? rpl::single(
+			[&]() -> HistoryItem* {
+				// Mogram: данные уже в памяти, плашку показываем сразу.
+				const auto music = &peer->owner().savedMusic();
+				return (music->countKnown(peer->id)
+					&& !music->list(peer->id).empty())
+					? music->list(peer->id).front().get()
+					: nullptr;
+			}()
+		) | rpl::filter([](HistoryItem *item) {
+			return item != nullptr;
+		}) | rpl::then(Data::SavedMusicList(
 			peer,
 			nullptr,
 			1
 		) | rpl::map([=](const Data::SavedMusicSlice &data) {
 			return data.size() ? data[0].get() : nullptr;
-		}) | rpl::type_erased
+		})) | rpl::type_erased
 		: rpl::single<HistoryItem*>((HistoryItem*)(nullptr));
 
 	const auto divider = container->add(
