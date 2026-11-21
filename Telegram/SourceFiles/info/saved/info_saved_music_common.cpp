@@ -43,8 +43,7 @@ void SetupSavedMusic(
 			[&]() -> HistoryItem* {
 				// Mogram: данные уже в памяти, плашку показываем сразу.
 				const auto music = &peer->owner().savedMusic();
-				return (music->countKnown(peer->id)
-					&& !music->list(peer->id).empty())
+				return (!music->list(peer->id).empty())
 					? music->list(peer->id).front().get()
 					: nullptr;
 			}()
