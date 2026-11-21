@@ -22,6 +22,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "settings/sections/settings_premium.h"
 #include "styles/style_calls.h"
+#include "styles/style_layers.h"
 #include "styles/style_chat_helpers.h"
 
 namespace Ui {
@@ -191,7 +192,15 @@ void ChooseSendAsBox(
 	const auto controller = lifetime.make_state<ListController>(
 		list,
 		chosen);
-	controller->setStyleOverrides(&st.list, nullptr);
+	// Mogram: список того же цвета, что верх и низ окна.
+	const auto listStyle = (&st == &st::defaultChooseSendAs)
+		? lifetime.make_state<style::PeerList>(st.list)
+		: nullptr;
+	if (listStyle) {
+		listStyle->bg = st::boxBg;
+		listStyle->item.button.textBg = st::boxBg;
+	}
+	controller->setStyleOverrides(listStyle ? listStyle : &st.list, nullptr);
 
 	controller->clicked(
 	) | rpl::on_next([=](not_null<PeerData*> peer) {
