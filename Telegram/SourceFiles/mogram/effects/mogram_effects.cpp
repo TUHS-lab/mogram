@@ -23,6 +23,7 @@
 #include <QtCore/QFileInfo>
 #include <QtCore/QPointer>
 #include <QtCore/QTimer>
+#include <QtWidgets/QApplication>
 #include <QtGui/QRegion>
 #include <QtGui/QMouseEvent>
 #include <QtCore/QRandomGenerator>
@@ -1003,13 +1004,11 @@ private:
 		// Одно правило заливки на все части: пилюли пересекаются с кружком,
 		// и при чётно-нечётном правиле в местах пересечения возникали дырки.
 		clear.setFillRule(Qt::WindingFill);
-		clear.addEllipse(QRectF(_circle).adjusted(-1, -1, 1, 1));
-		const auto radius = style::ConvertScale(9);
-		const auto side = style::ConvertScale(4);
-		const auto vert = style::ConvertScale(2);
+		clear.addEllipse(QRectF(_circle));
+		const auto radius = style::ConvertScale(8);
 		for (const auto &pill : _pills) {
 			clear.addRoundedRect(
-				QRectF(pill).adjusted(-side, -vert, side, vert),
+				QRectF(pill),
 				radius,
 				radius);
 		}
@@ -1041,8 +1040,10 @@ protected:
 	bool eventFilter(QObject *watched, QEvent *event) override {
 		if (event->type() == QEvent::MouseButtonPress) {
 			// Нажатие на само размытие его только убирает и не запускает просмотр.
+			// Событие приходит сначала окну, поэтому смотрим, что под курсором.
 			const auto overlay = RoundFocusCurrent.data();
-			if (!overlay || watched != overlay) {
+			const auto under = QApplication::widgetAt(QCursor::pos());
+			if (!overlay || !overlay->isVisible() || under != overlay) {
 				RoundFocusLastPress = crl::now();
 			}
 		}
