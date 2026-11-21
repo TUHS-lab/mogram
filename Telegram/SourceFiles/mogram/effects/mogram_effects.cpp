@@ -954,7 +954,7 @@ public:
 		_fade.start([=] {
 			update();
 		}, _fade.value(1.), 0., 220, anim::easeOutCubic);
-		QTimer::singleShot(260, this, [=] { deleteLater(); });
+		QTimer::singleShot(300, this, [=] { deleteLater(); });
 	}
 
 	[[nodiscard]] bool dismissed() const {
@@ -964,7 +964,8 @@ public:
 protected:
 	void paintEvent(QPaintEvent *e) override {
 		auto p = QPainter(this);
-		p.setOpacity(_fade.value(1.));
+		// После конца анимации value() отдаёт запасное значение: при исчезновении это 0.
+		p.setOpacity(_fade.value(_dismissed ? 0. : 1.));
 		if (!_layer.isNull()) {
 			p.drawPixmap(rect(), _layer);
 		}
