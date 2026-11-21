@@ -52,16 +52,6 @@ void SetupSavedMusic(
 			container,
 			object_ptr<Ui::VerticalLayout>(container)));
 
-	// Mogram: первая плашка появляется сразу, без выезда: при возврате в
-	// профиль данные уже есть, и зона с музыкой не должна пропадать.
-	struct First {
-		bool value = true;
-		bool take() {
-			return std::exchange(value, false);
-		}
-	};
-	const auto first = container->lifetime().make_state<First>();
-
 	rpl::combine(
 		std::move(musicValue),
 		std::move(topBarColor)
@@ -78,7 +68,7 @@ void SetupSavedMusic(
 				divider->entity()->widgetAt(0).get());
 			existing->updateData(DocumentMusicButtonData(document));
 			existing->setOverrideBg(color);
-			divider->toggle(true, first->take() ? anim::type::instant : anim::type::normal);
+			divider->toggle(true, anim::type::normal);
 			return;
 		}
 		while (divider->entity()->count()) {
@@ -95,7 +85,7 @@ void SetupSavedMusic(
 						}));
 				music->setOverrideBg(color);
 			}
-			divider->toggle(true, first->take() ? anim::type::instant : anim::type::normal);
+			divider->toggle(true, anim::type::normal);
 		}
 	}, container->lifetime());
 	divider->finishAnimating();
