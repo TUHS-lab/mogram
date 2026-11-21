@@ -914,11 +914,11 @@ public:
 		setCursor(Qt::ArrowCursor);
 		_expire.setSingleShot(true);
 		_expire.setInterval(1500);
-		connect(&_expire, &QTimer::timeout, this, [=] { deleteLater(); });
+		connect(&_expire, &QTimer::timeout, this, [=] { fadeOut(); });
 	}
 
 	void setCircle(QRect circleInWindow, std::vector<QRect> pills) {
-		if (_capturing) {
+		if (_capturing || _dismissed) {
 			return;
 		}
 		const auto pillsChanged = (_pills != pills);
@@ -943,6 +943,20 @@ public:
 		updateMask();
 	}
 
+	// Плавное исчезновение: слой больше не принимает мышь и не обновляется.
+	void fadeOut() {
+		if (_dismissed) {
+			return;
+		}
+		_dismissed = true;
+		_expire.stop();
+		setAttribute(Qt::WA_TransparentForMouseEvents);
+		_fade.start([=] {
+			update();
+		}, _fade.value(1.), 0., 220, anim::easeOutCubic);
+		QTimer::singleShot(260, this, [=] { deleteLater(); });
+	}
+
 	[[nodiscard]] bool dismissed() const {
 		return _dismissed;
 	}
@@ -957,10 +971,8 @@ protected:
 	}
 
 	void mousePressEvent(QMouseEvent *e) override {
-		_dismissed = true;
 		RoundFocusDismissedFlag() = true;
-		hide();
-		deleteLater();
+		fadeOut();
 	}
 
 public:
