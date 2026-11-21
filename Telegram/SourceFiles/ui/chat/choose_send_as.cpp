@@ -193,7 +193,7 @@ void ChooseSendAsBox(
 		list,
 		chosen);
 	// Mogram: список того же цвета, что верх и низ окна.
-	const auto listStyle = (&st == &st::defaultChooseSendAs)
+	const auto listStyle = (st.list.bg->c != st::groupCallMembersBg->c)
 		? lifetime.make_state<style::PeerList>(st.list)
 		: nullptr;
 	if (listStyle) {
