@@ -138,6 +138,12 @@ PRIVATE
     mogram/music/mogram_music_canvas.h
     mogram/music/mogram_lyrics.cpp
     mogram/music/mogram_lyrics.h
+    mogram/music/mogram_lyrics_ui.cpp
+    mogram/music/mogram_lyrics_ui.h
+    mogram/music/mogram_music_presence.cpp
+    mogram/music/mogram_music_presence.h
+    mogram/music/mogram_youtube_music.cpp
+    mogram/music/mogram_youtube_music.h
     mogram/music/mogram_motion.cpp
     mogram/music/mogram_motion.h
     mogram/music/mogram_motion_protocol.cpp
