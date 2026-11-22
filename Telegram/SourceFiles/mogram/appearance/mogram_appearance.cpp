@@ -512,7 +512,7 @@ void RegisterSettings() {
 		.title = QString::fromUtf8(Mogram::Lang::Tr("Комментарии SoundCloud")),
 		.description = QString::fromUtf8(Mogram::Lang::Tr("Аватарки справа от текущей строки, а без текста песни на полосе прогресса. Наведи, чтобы прочитать; колёсико переключает комментарии в группе.")),
 		.kind = S::Kind::Bool,
-		.defaultValue = true,
+		.defaultValue = false,
 	});
 	Music::RegisterMotionSettings();
 }
