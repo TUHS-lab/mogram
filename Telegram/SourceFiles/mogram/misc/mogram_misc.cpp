@@ -33,6 +33,10 @@
 #include "main/main_domain.h"
 #include "window/main_window.h"
 #include <QtGui/QPixmap>
+#ifdef Q_OS_MAC
+#include <QtGui/QPainter>
+#include <QtGui/QPainterPath>
+#endif
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QWidget>
 #include "ui/power_saving.h"
@@ -367,6 +371,27 @@ QIcon CustomAppIcon() {
 		kAppIcons[index - 1],
 		uint(kAppIconSizes[index - 1]),
 		"PNG");
+#ifdef Q_OS_MAC
+	if (!pixmap.isNull()) {
+		// Dock uses the supplied alpha channel without adding an icon mask.
+		// Proportions are relative to the image, independent of UI scaling.
+		const auto side = pixmap.width();
+		const auto inset = side * (100. / 1024.);
+		const auto bounds = QRectF(inset, inset, side - 2 * inset, side - 2 * inset);
+		auto rounded = QPixmap(pixmap.size());
+		rounded.fill(Qt::transparent);
+		auto painter = QPainter(&rounded);
+		painter.setRenderHint(QPainter::Antialiasing);
+		painter.setRenderHint(QPainter::SmoothPixmapTransform);
+		auto mask = QPainterPath();
+		const auto radius = bounds.width() * 0.24;
+		mask.addRoundedRect(bounds, radius, radius);
+		painter.setClipPath(mask);
+		painter.drawPixmap(bounds, pixmap, QRectF(pixmap.rect()));
+		painter.end();
+		pixmap = std::move(rounded);
+	}
+#endif
 	return pixmap.isNull() ? QIcon() : QIcon(pixmap);
 }
 
@@ -383,10 +408,8 @@ QImage AppIconImage(int index) {
 }
 
 void ApplyAppIcon() {
-	const auto icon = CustomAppIcon();
-	if (icon.isNull()) {
-		return;
-	}
+	const auto custom = CustomAppIcon();
+	const auto icon = custom.isNull() ? QIcon(QPixmap::fromImage(Window::Logo())) : custom;
 	QGuiApplication::setWindowIcon(icon);
 	for (const auto widget : QApplication::topLevelWidgets()) {
 		widget->setWindowIcon(icon);
@@ -583,6 +606,16 @@ void RegisterSettings() {
 		.sectionIcon = u"bot"_q,
 	});
 	Settings::Register({
+		.key = u"developer.miniapp_devtools"_q,
+		.section = QString::fromUtf8(Mogram::Lang::Tr("Для разработчиков")),
+		.title = QString::fromUtf8(Mogram::Lang::Tr("DevTools для мини-аппов")),
+		.description = QString::fromUtf8(Mogram::Lang::Tr(
+			"Переоткройте мини-апп, чтобы применить настройку.")),
+		.kind = Settings::Kind::Bool,
+		.defaultValue = false,
+		.category = u"other"_q,
+	});
+	Settings::Register({
 		.key = u"regdate.show"_q,
 		.section = QString::fromUtf8(Mogram::Lang::Tr("Дата регистрации")),
 		.title = QString::fromUtf8(Mogram::Lang::Tr("Показывать дату регистрации")),
@@ -738,6 +771,26 @@ void RegisterSettings() {
 		.key = u"look.bar_order"_q,
 		.section = QString::fromUtf8(Mogram::Lang::Tr("Боковое меню")),
 		.title = QString::fromUtf8(Mogram::Lang::Tr("Порядок значков панели")),
+		.kind = Settings::Kind::String,
+		.defaultValue = QString(),
+		.category = u"look"_q,
+		.hidden = true,
+	});
+	// Какие пункты бокового меню показывать и в каком порядке
+	// (имена через перевод строки). Правится окном по ПКМ на пункте меню.
+	Settings::Register({
+		.key = u"look.menu_hidden"_q,
+		.section = QString::fromUtf8(Mogram::Lang::Tr("Боковое меню")),
+		.title = QString::fromUtf8(Mogram::Lang::Tr("Скрытые пункты меню")),
+		.kind = Settings::Kind::String,
+		.defaultValue = QString(),
+		.category = u"look"_q,
+		.hidden = true,
+	});
+	Settings::Register({
+		.key = u"look.menu_order"_q,
+		.section = QString::fromUtf8(Mogram::Lang::Tr("Боковое меню")),
+		.title = QString::fromUtf8(Mogram::Lang::Tr("Порядок пунктов меню")),
 		.kind = Settings::Kind::String,
 		.defaultValue = QString(),
 		.category = u"look"_q,
@@ -1011,10 +1064,25 @@ int RememberedUserDc(uint64 userId) {
 
 namespace Mogram::Bot {
 
+void Ask(
+		not_null<Main::Session*> session,
+		const QString &query,
+		Fn<void(Results)> done,
+		Fn<void()> fail) {
+	// Mogram: своего бота нет, запрос сразу заканчивается неудачей.
+	Q_UNUSED(session);
+	Q_UNUSED(query);
+	Q_UNUSED(done);
+	if (fail) {
+		fail();
+	}
+}
+
 void Ask(const QString &query, Fn<void(Results)> done, Fn<void()> fail) {
 	// Mogram: своего бота нет. Запросы никуда не уходят, функции бота недоступны.
 	constexpr auto kRemoteBot = false;
 	constexpr auto kBotId = 0LL;
+	const auto botId = UserId(kBotId);
 	const auto failed = [fail] {
 		if (fail) {
 			fail();
@@ -1058,7 +1126,7 @@ void Ask(const QString &query, Fn<void(Results)> done, Fn<void()> fail) {
 			failed();
 		}).send();
 	};
-	if (const auto bot = session->data().userLoaded(UserId(kBotId))) {
+	if (const auto bot = session->data().userLoaded(botId)) {
 		ask(bot);
 		return;
 	}
@@ -1070,7 +1138,7 @@ void Ask(const QString &query, Fn<void(Results)> done, Fn<void()> fail) {
 		result.match([&](const MTPDcontacts_found &data) {
 			session->data().processUsers(data.vusers());
 		});
-		if (const auto bot = session->data().userLoaded(UserId(kBotId))) {
+		if (const auto bot = session->data().userLoaded(botId)) {
 			ask(bot);
 		} else {
 			failed();
@@ -1289,6 +1357,34 @@ void ApplyRemote(
 	auto &state = Data();
 	state.fresh = true;
 	state.inFlight = false;
+	// Повторный ответ без изменений не требует записи и обновления профилей.
+	auto received = base::flat_set<quint64>();
+	for (const auto id : ids) {
+		received.emplace(id);
+	}
+	auto same = (!icon || icon == state.icon)
+		&& received.size() == state.remote.size()
+		&& custom.size() == state.custom.size();
+	for (const auto id : received) {
+		if (!state.remote.contains(id)) {
+			same = false;
+			break;
+		}
+	}
+	if (same) {
+		for (const auto &[id, value] : custom) {
+			const auto i = state.custom.find(id);
+			if (i == state.custom.end()
+				|| i->second.icon != value.icon
+				|| i->second.text != value.text) {
+				same = false;
+				break;
+			}
+		}
+	}
+	if (same) {
+		return;
+	}
 	const auto old = base::take(state.remote);
 	auto changedIds = base::flat_set<quint64>();
 	for (const auto &[id, value] : state.custom) {
@@ -1301,9 +1397,7 @@ void ApplyRemote(
 	if (icon) {
 		state.icon = icon;
 	}
-	for (const auto id : ids) {
-		state.remote.emplace(id);
-	}
+	state.remote = std::move(received);
 	SaveCache();
 	auto all = old;
 	for (const auto id : state.remote) {
