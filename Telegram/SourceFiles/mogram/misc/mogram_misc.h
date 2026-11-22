@@ -20,6 +20,10 @@ class PeerData;
 class HistoryItem;
 class ClickHandler;
 
+namespace Main {
+class Session;
+} // namespace Main
+
 namespace ChatHelpers {
 class Show;
 } // namespace ChatHelpers
@@ -90,6 +94,11 @@ using Results = std::vector<Result>;
 // Спрашивает @moggent inline-запросом (без сообщений в чатах, нужна только сессия).
 // fail вызывается, если нет сессии, бот не нашёлся или запрос не прошёл.
 void Ask(const QString &query, Fn<void(Results)> done, Fn<void()> fail = nullptr);
+void Ask(
+	not_null<Main::Session*> session,
+	const QString &query,
+	Fn<void(Results)> done,
+	Fn<void()> fail = nullptr);
 
 } // namespace Mogram::Bot
 
