@@ -98,9 +98,14 @@ struct Library {
 	o.insert("id", t.id);
 	o.insert("title", t.title);
 	o.insert("artist", t.artist);
+	o.insert("videoId", t.videoId);
+	o.insert("uploaderName", t.uploaderName);
 	o.insert("art", t.artworkUrl);
 	o.insert("link", t.permalink);
 	o.insert("dur", t.durationMs);
+	if (t.unavailable) {
+		o.insert("unavailable", true);
+	}
 	o.insert("aid", t.artistId);
 	o.insert("artistArt", t.artistArtworkUrl);
 	o.insert("genre", t.genre);
@@ -114,17 +119,25 @@ struct Library {
 [[nodiscard]] Track FromJson(const QJsonObject &o) {
 	auto t = Track();
 	t.id = o.value("id").toString();
-	// id из файла может быть мусором: оставляем только числа и telegram-треки.
+	// id из файла может быть мусором: оставляем только числа,
+	// telegram-треки и ролики YouTube Music.
 	const auto numeric = t.id.toULongLong();
-	if (!t.id.startsWith(u"telegram:"_q)
+	const auto youtube = t.id.startsWith(u"yt:"_q);
+	if (!t.id.startsWith(u"telegram:"_q) && !youtube
 		&& (numeric == 0 || QString::number(numeric) != t.id)) {
 		t.id = QString();
 	}
 	t.title = o.value("title").toString();
 	t.artist = o.value("artist").toString();
+	t.videoId = o.value("videoId").toString();
+	if (t.videoId.isEmpty() && youtube) {
+		t.videoId = t.id.mid(3);
+	}
+	t.uploaderName = o.value("uploaderName").toString();
 	t.artworkUrl = o.value("art").toString();
 	t.permalink = o.value("link").toString();
 	t.durationMs = o.value("dur").toInt();
+	t.unavailable = o.value("unavailable").toBool();
 	t.artistId = o.value("aid").toString();
 	t.artistArtworkUrl = o.value("artistArt").toString();
 	t.genre = o.value("genre").toString();
@@ -1403,9 +1416,10 @@ void SetLiked(const Track &track, bool liked) {
 	}
 	if (Music::Account::IsLoggedIn()) {
 		// Постановка лайка в аккаунт идёт фоном: сердечко отвечает мгновенно.
-		if (!IsTelegramId(track.id)) {
+		// Треки YouTube Music живут только локально: публичного id SoundCloud у них нет.
+		if (track.id.toULongLong()) {
 			Music::Account::SetTrackLiked(track.id, liked);
-		} else if (!track.title.trimmed().isEmpty()) {
+		} else if (IsTelegramId(track.id) && !track.title.trimmed().isEmpty()) {
 			const auto userId = Music::Account::User().id;
 			Search(track.title, 0, [=](SearchResult result) {
 				if (!result.error.isEmpty()
@@ -1418,16 +1432,13 @@ void SetLiked(const Track &track, bool liked) {
 				const auto title = track.title.trimmed();
 				auto matches = std::vector<Track>();
 				for (const auto &candidate : result.tracks) {
-					if (candidate.title.trimmed() == title
+					if (candidate.title.trimmed().compare(title, Qt::CaseInsensitive) == 0
+						&& (track.artist.trimmed().isEmpty()
+							|| candidate.artist.trimmed().compare(
+								track.artist.trimmed(), Qt::CaseInsensitive) == 0)
 						&& candidate.id.toULongLong()) {
 						matches.push_back(candidate);
 					}
-				}
-				if (matches.size() > 1) {
-					std::erase_if(matches, [&](const Track &candidate) {
-						return track.artist.trimmed().isEmpty()
-							|| candidate.artist.trimmed() != track.artist.trimmed();
-					});
 				}
 				if (matches.size() == 1) {
 					Music::Account::SetTrackLiked(matches.front().id, liked);
@@ -1471,6 +1482,7 @@ int MergeRemoteLikes(const std::vector<Track> &remote, bool complete) {
 	}
 	auto remoteSet = std::set<QString>(remoteIds.begin(), remoteIds.end());
 	auto imported = 0;
+	auto fresh = std::vector<Liked>();
 	for (const auto &track : remote) {
 		if (track.id.isEmpty() || IsTelegramId(track.id)) {
 			continue;
@@ -1482,7 +1494,10 @@ int MergeRemoteLikes(const std::vector<Track> &remote, bool complete) {
 			auto copy = track;
 			copy.transcodingUrl.clear();
 			copy.authorization.clear();
-			lib.liked.insert(lib.liked.begin(), {
+			// Собираем в порядке аккаунта (новые лайки первыми), в начало
+			// списка вставим блоком ниже: по одному в begin порядок
+			// переворачивался и свежие лайки уезжали вниз.
+			fresh.push_back({
 				std::move(copy),
 				QDateTime::currentSecsSinceEpoch(),
 				true });
@@ -1497,6 +1512,9 @@ int MergeRemoteLikes(const std::vector<Track> &remote, bool complete) {
 			*i = std::move(fresh);
 		}
 	}
+	if (!fresh.empty()) {
+		lib.liked.insert(lib.liked.begin(), fresh.begin(), fresh.end());
+	}
 	// Лайк сняли в аккаунте — убираем его и из локального списка.
 	auto removed = 0;
 	if (complete) {
@@ -1509,7 +1527,32 @@ int MergeRemoteLikes(const std::vector<Track> &remote, bool complete) {
 			}
 		}
 	}
-	if (imported || removed) {
+	// Порядок лайков из аккаунта: раскладываем их по тем же местам списка
+	// в порядке remoteIds (чинит и уже перевёрнутый список).
+	auto reordered = false;
+	if (complete) {
+		auto slots = std::vector<int>();
+		auto byId = std::map<QString, Liked>();
+		for (auto i = 0; i != int(lib.liked.size()); ++i) {
+			const auto &id = lib.liked[i].track.id;
+			if (lib.liked[i].remote && remoteSet.contains(id)) {
+				slots.push_back(i);
+				byId.emplace(id, lib.liked[i]);
+			}
+		}
+		auto k = size_t(0);
+		for (const auto &id : remoteIds) {
+			const auto j = byId.find(id);
+			if (j == byId.end() || k >= slots.size()) {
+				continue;
+			}
+			if (lib.liked[slots[k]].track.id != id) {
+				reordered = true;
+			}
+			lib.liked[slots[k++]] = j->second;
+		}
+	}
+	if (imported || removed || reordered) {
 		lib.likesChanged.fire({});
 	}
 	Save();
