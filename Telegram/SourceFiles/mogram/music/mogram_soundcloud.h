@@ -12,8 +12,6 @@
 #include <QtCore/QString>
 #include <QtCore/QStringList>
 #include <QtGui/QImage>
-#include <optional>
-#include <variant>
 #include <vector>
 
 namespace Mogram::Music {
@@ -22,7 +20,6 @@ struct Track {
 	QString id;
 	QString title;
 	QString artist;
-	QString videoId;         // ролик YouTube Music, если трек оттуда
 	QString artworkUrl;      // 100x100, для крупной заменить на t500x500
 	QString permalink;
 	QString transcodingUrl;  // выбранный вариант потока (progressive mp3 или hls)
@@ -39,10 +36,7 @@ struct Track {
 	qint64 playbackCount = 0;
 	qint64 likesCount = 0;
 	qint64 createdAt = 0;    // unix time
-	QString uploaderName;
 };
-
-[[nodiscard]] QStringList TrackArtistNames(const Track &track);
 
 struct SearchResult {
 	std::vector<Track> tracks;
@@ -96,41 +90,13 @@ void LoadArtistInfo(
 	const QString &userId,
 	Fn<void(ArtistInfo)> done);
 
-void ResolveTrackArtist(
-	const Track &track,
-	const QString &name,
-	Fn<void(ArtistInfo)> done);
-
-enum class ReleaseKind {
-	Unknown,
-	Album,
-	Single,
-	Ep,
-	Compilation,
-};
-
 struct Album {
 	QString id;
 	QString title;
 	QString artist;
 	QString artworkUrl;
 	int trackCount = 0;
-	QString artistId;
-	ReleaseKind releaseKind = ReleaseKind::Unknown;
-	int releaseYear = 0;
-	// nullopt: some of the track artwork is unknown.
-	std::optional<QString> backdropArtworkUrl;
 };
-
-enum class SearchCategory { All, Tracks, Playlists, Albums, Artists };
-
-using CatalogItem = std::variant<Track, Album, ArtistInfo>;
-
-// Разнородные результаты в порядке релевантности SoundCloud.
-void SearchCatalog(
-	const QString &query,
-	SearchCategory category,
-	Fn<void(std::vector<CatalogItem>, QString error)> done);
 
 // Альбомы по запросу.
 void SearchAlbums(
@@ -157,27 +123,16 @@ void AlbumTracks(
 	const QString &albumId,
 	Fn<void(std::vector<Track>, QString error)> done);
 
-void LoadAlbumBackdrop(const Album &album, Fn<void(QString)> done);
-
 // Поиск с произвольным лимитом (для подбора кандидатов).
 void SearchLimited(
 	const QString &query,
 	int limit,
 	Fn<void(std::vector<Track>)> done);
 
-using AudioFileDone = Fn<void(const QString &path, const QString &error)>;
-
 // Скачивает трек (HLS склеивается) в кэш и отдаёт путь к файлу. Уже скачанный отдаётся сразу.
 void Download(
 	const Track &track,
-	AudioFileDone done);
-
-// Объединяет запросы к одному файлу и обновляет общий LRU кэша аудио.
-void LoadCachedAudio(
-	const QString &key,
-	const QString &cachedPath,
-	Fn<void(AudioFileDone)> load,
-	AudioFileDone done);
+	Fn<void(const QString &path, const QString &error)> done);
 
 // Картинка по ссылке (обложки). Результат кэшируется в памяти.
 void LoadImage(const QString &url, Fn<void(QImage)> done);

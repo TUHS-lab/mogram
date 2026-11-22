@@ -100,7 +100,7 @@ struct Prepared {
 
 struct Job {
 	not_null<Main::Session*> session;
-	std::vector<FullMsgId> items;
+	std::vector<not_null<HistoryItem*>> items;
 	Api::SendAction action;
 	bool dropCaptions = false;
 	int index = 0;
@@ -296,19 +296,14 @@ void SendAlbum(
 void Process(std::shared_ptr<Job> job) {
 	auto &items = job->items;
 	while (job->index < int(items.size())) {
-		const auto first = job->session->data().message(items[job->index]);
-		if (!first) {
-			++job->index;
-			continue;
-		}
+		const auto first = items[job->index];
 		auto batch = std::vector<not_null<HistoryItem*>>{ first };
 		if (const auto group = first->groupId()) {
 			for (auto i = job->index + 1; i < int(items.size()); ++i) {
-				const auto item = job->session->data().message(items[i]);
-				if (!item || item->groupId() != group) {
+				if (items[i]->groupId() != group) {
 					break;
 				}
-				batch.push_back(item);
+				batch.push_back(items[i]);
 			}
 		}
 		auto prepared = std::vector<Prepared>();
@@ -371,15 +366,10 @@ void CopyForward(
 		return a->date() < b->date()
 			|| (a->date() == b->date() && a->id < b->id);
 	});
-	auto ids = std::vector<FullMsgId>();
-	ids.reserve(items.size());
-	for (const auto item : items) {
-		ids.push_back(item->fullId());
-	}
 	Ui::Toast::Show(U("Чат защищён: пересылаю копией…"));
 	Process(std::make_shared<Job>(Job{
 		.session = session,
-		.items = std::move(ids),
+		.items = std::move(items),
 		.action = std::move(action),
 		.dropCaptions = dropCaptions,
 	}));

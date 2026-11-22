@@ -1708,7 +1708,7 @@ void AskForRestart() {
 		return u"look"_q;
 	} else if (starts({ "chats.", "fx.", "inline.", "translation.", "documents.", "time.", "bots.", "adblock." })) {
 		return u"chats"_q;
-	} else if (starts({ "misc.stars", "quote.", "developer." })) {
+	} else if (starts({ "misc.stars", "quote." })) {
 		return u"tools"_q;
 	}
 	return u"look"_q;
@@ -3648,6 +3648,7 @@ namespace {
 		{ &st::menuIconToMainMenu, QString::fromUtf8("➡️") },
 		{ &st::menuIconTradable, QString::fromUtf8("📈") },
 		{ &st::menuIconTransparent, QString::fromUtf8("🔘") },
+		{ &st::menuIconTTLAny, QString::fromUtf8("⏳") },
 		{ &st::menuIconUnarchive, QString::fromUtf8("📁") },
 		{ &st::menuIconUnblock, QString::fromUtf8("✅") },
 		{ &st::menuIconUnfave, QString::fromUtf8("❌") },
@@ -3808,8 +3809,9 @@ void ShowSupportBox(Window::SessionController *controller) {
 				text,
 				TextLabelStyle());
 			const auto state = std::make_shared<std::shared_ptr<void>>();
+			constexpr auto kIcon = 26;
+			constexpr auto kLeft = 42;
 			row->widthValue() | rpl::on_next([=](int width) {
-				const auto kLeft = style::ConvertScale(42);
 				const auto inner = std::max(width - kLeft, 1);
 				head->resizeToWidth(inner);
 				body->resizeToWidth(inner);
@@ -3821,7 +3823,6 @@ void ShowSupportBox(Window::SessionController *controller) {
 				}
 			}, row->lifetime());
 			row->paintOn([=](QPainter &p) {
-				const auto kIcon = style::ConvertScale(26);
 				PaintPackIcon(p, QRect(0, 1, kIcon, kIcon), alt, *state, row);
 			});
 		};

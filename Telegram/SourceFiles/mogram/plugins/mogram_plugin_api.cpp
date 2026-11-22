@@ -96,7 +96,6 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QFileInfo>
-#include <QtCore/QSaveFile>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QStandardPaths>
 #include <QtCore/QThread>
@@ -258,14 +257,8 @@ template <typename Callback>
 		return callback();
 	}
 	auto promise = std::make_shared<std::promise<std::string>>();
-	// 0 ожидает, 1 выполняется, 2 отменено до начала.
-	const auto state = std::make_shared<std::atomic<int>>(0);
 	auto future = promise->get_future();
 	crl::on_main([=]() mutable {
-		auto expected = 0;
-		if (!state->compare_exchange_strong(expected, 1)) {
-			return;
-		}
 		promise->set_value(callback());
 	});
 	for (auto waited = 0; waited != 50; ++waited) {
@@ -277,11 +270,7 @@ template <typename Callback>
 			break;
 		}
 	}
-	auto expected = 0;
-	if (state->compare_exchange_strong(expected, 2)) {
-		return Reply(false, U(Mogram::Lang::Tr("клиент не ответил вовремя")));
-	}
-	return Reply(false, U(Mogram::Lang::Tr("операция началась, результат неизвестен")));
+	return Reply(false, U(Mogram::Lang::Tr("клиент не ответил вовремя")));
 }
 
 std::string ShowToast(const QJsonObject &args) {
@@ -2109,11 +2098,11 @@ std::string InvokeRaw(const QJsonObject &args) {
 
 std::atomic<int> FilterCount = 0;
 std::set<std::string> FilterPlugins;
-std::map<FullMsgId, std::pair<QString, bool>> FilterCache;
+std::map<FullMsgId, bool> FilterCache;
 
 std::atomic<int> TextHookCount = 0;
 std::set<std::string> TextHookPlugins;
-std::map<FullMsgId, std::pair<TextWithEntities, TextWithEntities>> TextTransformCache;
+std::map<FullMsgId, std::pair<TimeId, TextWithEntities>> TextTransformCache;
 
 std::atomic<int> BadgeHookCount = 0;
 std::set<std::string> BadgeHookPlugins;
@@ -3025,39 +3014,19 @@ QJsonArray EntitiesToJsonArray(const EntitiesInText &list) {
 
 namespace {
 
-bool CopyTree(const QString &from, const QString &to) {
+void CopyTree(const QString &from, const QString &to) {
 	const auto dir = QDir(from);
-	if (!QDir().mkpath(to)) {
-		return false;
-	}
+	QDir().mkpath(to);
 	for (const auto &info : dir.entryInfoList(
 			QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot)) {
 		const auto target = QDir(to).filePath(info.fileName());
-		if (info.isSymLink()) {
-			return false;
-		} else if (info.isDir()) {
-			if (!CopyTree(info.absoluteFilePath(), target)) {
-				return false;
-			}
+		if (info.isDir()) {
+			CopyTree(info.absoluteFilePath(), target);
 		} else if (info.fileName() != u"secrets.enc"_q) {
-			auto source = QFile(info.absoluteFilePath());
-			auto destination = QSaveFile(target);
-			if (!source.open(QIODevice::ReadOnly)
-				|| !destination.open(QIODevice::WriteOnly)) {
-				return false;
-			}
-			while (!source.atEnd()) {
-				const auto chunk = source.read(64 * 1024);
-				if (chunk.isEmpty() || destination.write(chunk) != chunk.size()) {
-					return false;
-				}
-			}
-			if (source.error() != QFileDevice::NoError || !destination.commit()) {
-				return false;
-			}
+			QFile::remove(target);
+			QFile::copy(info.absoluteFilePath(), target);
 		}
 	}
-	return true;
 }
 
 } // namespace
@@ -3080,40 +3049,24 @@ void ApplyPendingRestore() {
 		}
 		auto source = QFile(from);
 		if (!source.open(QIODevice::ReadOnly)) {
-			LOG(("[mogram] Restore: cannot read %1").arg(name));
-			return;
+			continue;
 		}
 		// Фильтр настроек применяем и здесь: карантин мог быть заполнен в обход Python.
 		auto data = source.readAll();
-		if (source.error() != QFileDevice::NoError) {
-			LOG(("[mogram] Restore: cannot read %1").arg(name));
-			return;
-		}
 		if (name == u"mog_settings.json"_q) {
 			data = FilterPortableSettings(data);
 		}
-		const auto path = tdata + name;
-		const auto backup = path + u".bak"_q;
-		if (QFile::exists(path) && !QFile::exists(backup)
-			&& !QFile::copy(path, backup)) {
-			LOG(("[mogram] Restore: cannot back up %1").arg(name));
-			return;
-		}
-		auto target = QSaveFile(path);
-		if (!target.open(QIODevice::WriteOnly)
-			|| target.write(data) != data.size()
-			|| !target.commit()) {
-			LOG(("[mogram] Restore: cannot write %1").arg(name));
-			return;
+		QFile::remove(tdata + name + u".bak"_q);
+		QFile::rename(tdata + name, tdata + name + u".bak"_q);
+		auto target = QFile(tdata + name);
+		if (target.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+			target.write(data);
 		}
 	}
 	if (QDir(root + u"plugin_data"_q).exists()) {
 		const auto base = QDir::cleanPath(
 			QString::fromStdString(PluginsDir()) + u"/../plugin_data"_q);
-		if (!CopyTree(root + u"plugin_data"_q, base)) {
-			LOG(("[mogram] Restore: cannot copy plugin data"));
-			return;
-		}
+		CopyTree(root + u"plugin_data"_q, base);
 	}
 	QDir(root).removeRecursively();
 }
@@ -3206,9 +3159,9 @@ void TransformMessageText(
 		return;
 	}
 	const auto id = item->fullId();
-	const auto original = text;
+	const auto edited = TimeId(qHash(item->originalText().text) & 0x7fffffff);
 	const auto i = TextTransformCache.find(id);
-	if (i != TextTransformCache.end() && i->second.first == original) {
+	if (i != TextTransformCache.end() && i->second.first == edited) {
 		text = i->second.second;
 		return;
 	}
@@ -3223,7 +3176,7 @@ void TransformMessageText(
 	message.insert("date", double(item->date()));
 	const auto answer = CallTextHook(Json(message), PluginLog);
 	if (answer.size() < 1) {
-		TextTransformCache[id] = { original, text };
+		TextTransformCache[id] = { edited, text };
 		return;
 	}
 	if (answer[0] == 'T') {
@@ -3241,7 +3194,7 @@ void TransformMessageText(
 			EntitiesFromJson(object.value("entities").toArray(), changed.size(), true),
 		};
 	}
-	TextTransformCache[id] = { original, text };
+	TextTransformCache[id] = { edited, text };
 }
 
 QString MessageBadge(not_null<const HistoryItem*> item) {
@@ -3269,16 +3222,15 @@ bool HiddenByPlugin(not_null<const HistoryItem*> item) {
 		return false;
 	}
 	const auto id = item->fullId();
-	const auto &text = item->originalText().text;
 	const auto i = FilterCache.find(id);
-	if (i != FilterCache.end() && i->second.first == text) {
-		return i->second.second;
+	if (i != FilterCache.end()) {
+		return i->second;
 	}
 	if (FilterCache.size() > 5000) {
 		FilterCache.clear();
 	}
 	const auto result = CallMessageFilter(Json(ItemBrief(item)), PluginLog);
-	FilterCache[id] = { text, result };
+	FilterCache[id] = result;
 	return result;
 }
 

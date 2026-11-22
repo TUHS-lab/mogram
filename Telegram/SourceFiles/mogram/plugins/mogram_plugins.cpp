@@ -873,18 +873,14 @@ void SetSandboxExcluded(std::vector<std::string> paths) {
 namespace {
 
 // Можно ли отдать папку песочнице: внутри домашней, не сама домашняя, не пересекается с запретными.
-bool MountAllowed(
-		const std::string &real,
-		const std::string &home,
-		const std::string &pluginRoot = {}) {
+bool MountAllowed(const std::string &real, const std::string &home) {
 	if (real.empty() || home.empty() || real == home || !PathInside(home, real)) {
 		return false;
 	}
 	auto &host = H();
 	const auto lock = std::lock_guard(host.excludeMutex);
 	for (const auto &banned : host.excluded) {
-		if (PathInside(real, banned)
-			|| (banned != pluginRoot && PathInside(banned, real))) {
+		if (PathInside(banned, real) || PathInside(real, banned)) {
 			return false;
 		}
 	}
@@ -932,13 +928,10 @@ std::vector<std::string> SandboxCommand(const std::string &bwrap, const LogFn &l
 		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp" });
 	const auto dataRoot = DataRoot();
 	const auto pluginsDir = PluginsDir();
-	const auto bindRw = [&](
-			const std::string &path,
-			const std::string &pluginRoot = std::string()) {
+	const auto bindRw = [&](const std::string &path) {
 		MakeDirs(path);
 		const auto real = SafeRealPath(path);
-		if ((pluginRoot.empty() || real == path)
-			&& MountAllowed(real, home, pluginRoot)) {
+		if (MountAllowed(real, home)) {
 			Push(args, { "--bind", real, real });
 			return true;
 		}
@@ -946,27 +939,12 @@ std::vector<std::string> SandboxCommand(const std::string &bwrap, const LogFn &l
 		return false;
 	};
 	const auto defaultRoot = home + "/.local/share/mogram";
-	MakeDirs(dataRoot);
-	if (SafeRealPath(dataRoot) != defaultRoot) {
+	if (SafeRealPath(dataRoot) == defaultRoot || (MakeDirs(dataRoot), SafeRealPath(dataRoot) == defaultRoot)) {
+		bindRw(dataRoot);
+	} else {
 		// Нестандартная папка плагинов (разработка): отдаём только её и данные плагинов.
 		bindRw(pluginsDir);
 		bindRw(dataRoot + "/plugin_data");
-	} else if (MountAllowed(defaultRoot, home)) {
-		bindRw(dataRoot);
-	} else {
-		// The default data root can also contain the client session.
-		if (bindRw(defaultRoot + "/plugin_state", defaultRoot)) {
-			bindRw(defaultRoot + "/plugins", defaultRoot);
-			bindRw(defaultRoot + "/plugin_data", defaultRoot);
-			for (const auto name : { "plugin_grants.json", "plugins_state.json", "secrets.key" }) {
-				const auto path = defaultRoot + '/' + name;
-				struct stat info;
-				if (::lstat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode)
-					&& MountAllowed(path, home, defaultRoot)) {
-					Push(args, { "--ro-bind", path, path });
-				}
-			}
-		}
 	}
 	// Журнал аудита хост менять не должен: поверх монтируем его только на чтение.
 	{
