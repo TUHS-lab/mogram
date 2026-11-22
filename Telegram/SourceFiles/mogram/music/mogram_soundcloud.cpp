@@ -13,14 +13,16 @@
 #include "core/application.h"
 #include "rpl/event_stream.h"
 
-#include <QtCore/QDateTime>
 #include <QtCore/QCoreApplication>
+#include <QtCore/QCryptographicHash>
+#include <QtCore/QDateTime>
 #include <QtCore/QDir>
 #include <QtCore/QFile>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QRegularExpression>
+#include <QtCore/QSaveFile>
 #include <QtCore/QStandardPaths>
 #include <QtCore/QTimer>
 #include <QtCore/QUrl>
@@ -31,9 +33,12 @@
 
 #include <map>
 #include <memory>
+#include <array>
 #include <deque>
 #include <set>
 #include <algorithm>
+#include <tuple>
+#include <utility>
 
 namespace Mogram::Music {
 namespace {
@@ -45,6 +50,19 @@ constexpr auto kPageSize = 20;
 constexpr auto kMaxAudioBytes = 200 * 1024 * 1024; // предел на размер трека
 constexpr auto kMaxImageBytes = 32 * 1024 * 1024;  // предел на размер обложки
 constexpr auto kMaxHlsSegments = 512;              // предел числа сегментов HLS
+constexpr auto kConcurrentHlsSegments = 3;
+// Кэш обложек в памяти: LRU по числу и по размеру QImage, без полного clear().
+constexpr auto kImageCacheCount = 200;
+constexpr auto kImageCacheBytes = qint64(48) * 1024 * 1024; // ~200 обложек t500x500
+constexpr auto kCoverCacheCount = 200;
+constexpr auto kCoverCacheBytes = qint64(48) * 1024 * 1024;
+constexpr auto kArtistInfoCacheCount = 256;
+
+// Дисковый кэш треков: держим не больше kAudioCacheBytes и не больше kAudioCacheFiles
+// файлов, удаляя самые давно использованные. mtime файла обновляется при каждом
+// обращении, поэтому он же служит ключом LRU.
+constexpr auto kAudioCacheBytes = qint64(1024) * 1024 * 1024;
+constexpr auto kAudioCacheFiles = 400;
 constexpr auto kUserAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 constexpr auto kMaxLikesPages = 50;   // предел страниц лайков при синхронизации
 constexpr auto kMaxPlaylistPages = 50;
@@ -379,15 +397,76 @@ void ApiGet(
 	}
 }
 
+[[nodiscard]] int AacBitrate(const QJsonObject &transcoding) {
+	static const auto pattern = QRegularExpression(u"^aac_([1-9][0-9]*)k(?:_|$)"_q);
+	const auto preset = transcoding.value("preset").toString();
+	const auto bitrate = pattern.match(preset).captured(1).toInt();
+	if (bitrate > 0) {
+		return bitrate;
+	}
+	const auto quality = transcoding.value("quality").toString();
+	if (quality == u"hq"_q) {
+		return 256;
+	} else if (quality == u"sq"_q) {
+		return 160;
+	}
+	return 96;
+}
+
+struct TrackStream {
+	QString url;
+	QString extension;
+	bool hls = false;
+	std::tuple<int, bool, bool> rank;
+};
+
+[[nodiscard]] std::vector<TrackStream> ParseStreams(const QJsonObject &object) {
+	auto result = std::vector<TrackStream>();
+	for (const auto &value : object.value("media").toObject()
+			.value("transcodings").toArray()) {
+		const auto item = value.toObject();
+		if (item.value("snipped").toBool()) {
+			continue; // Превью-обрезка.
+		}
+		const auto format = item.value("format").toObject();
+		const auto protocol = format.value("protocol").toString();
+		const auto mime = format.value("mime_type").toString().section(';', 0, 0);
+		const auto hls = (protocol == u"hls"_q);
+		const auto aac = hls && (mime == u"audio/mp4"_q);
+		const auto mp3 = (hls || protocol == u"progressive"_q)
+			&& (mime == u"audio/mpeg"_q);
+		if (!aac && !mp3) {
+			continue;
+		}
+		const auto url = item.value("url").toString();
+		if (SafeMediaUrl(QUrl(url))) {
+			result.push_back({
+				.url = url,
+				.extension = aac ? u"m4a"_q : u"mp3"_q,
+				.hls = hls,
+				.rank = std::tuple(aac ? AacBitrate(item) : 128, aac, !hls),
+			});
+		}
+	}
+	std::stable_sort(result.begin(), result.end(), [](const TrackStream &a, const TrackStream &b) {
+		return a.rank > b.rank;
+	});
+	return result;
+}
+
 [[nodiscard]] Track ParseTrack(const QJsonObject &object) {
 	auto result = Track();
 	result.id = ResourceId(object, u"id"_q);
 	result.title = object.value("title").toString();
 	const auto user = object.value("user").toObject();
+	result.uploaderName = user.value("username").toString().trimmed();
 	result.artist = object.value("publisher_metadata").toObject()
 		.value("artist").toString().trimmed();
 	if (result.artist.isEmpty()) {
-		result.artist = user.value("username").toString();
+		result.artist = object.value("metadata_artist").toString().trimmed();
+	}
+	if (result.artist.isEmpty()) {
+		result.artist = result.uploaderName;
 	}
 	result.artworkUrl = object.value("artwork_url").toString();
 	if (result.artworkUrl.isEmpty()) {
@@ -416,39 +495,16 @@ void ApiGet(
 			}
 		}
 	}
-	auto progressive = QString();
-	auto hlsMp3 = QString();
-	auto hlsAac = QString();
-	for (const auto &value : object.value("media").toObject()
-			.value("transcodings").toArray()) {
-		const auto item = value.toObject();
-		const auto format = item.value("format").toObject();
-		const auto protocol = format.value("protocol").toString();
-		const auto mime = format.value("mime_type").toString();
-		const auto url = item.value("url").toString();
-		if (item.value("snipped").toBool()) {
-			continue; // Превью-обрезка.
-		}
-		if (protocol == u"progressive"_q && mime.contains(u"mpeg"_q)) {
-			progressive = url;
-		} else if (protocol == u"hls"_q && mime.contains(u"mpeg"_q)
-			&& !mime.contains(u"mpegurl"_q)) {
-			hlsMp3 = url;
-		} else if (protocol == u"hls"_q && mime.contains(u"mp4"_q)) {
-			hlsAac = url;
-		}
-	}
-	if (!progressive.isEmpty()) {
-		result.transcodingUrl = progressive;
-		result.extension = u"mp3"_q;
-	} else if (!hlsAac.isEmpty()) {
-		result.transcodingUrl = hlsAac;
-		result.extension = u"m4a"_q;
-		result.hls = true;
-	} else if (!hlsMp3.isEmpty()) {
-		result.transcodingUrl = hlsMp3;
-		result.extension = u"mp3"_q;
-		result.hls = true;
+	const auto streams = ParseStreams(object);
+	if (!streams.empty()) {
+		result.transcodingUrl = streams.front().url;
+		result.extension = streams.front().extension;
+		result.hls = streams.front().hls;
+	} else if (const auto full = object.value("full_duration").toInt(); full > 0) {
+		// SoundCloud отдаёт длительность превью в duration для закрытых треков.
+		result.durationMs = full;
+	} else if (object.value("policy").toString() == u"SNIP"_q) {
+		result.durationMs = 0;
 	}
 	return result;
 }
@@ -509,6 +565,27 @@ void ApiGet(
 	static auto result = std::map<QString, ArtistInfo>();
 	return result;
 }
+[[nodiscard]] std::deque<QString> &ArtistInfoOrder() {
+	static auto result = std::deque<QString>();
+	return result;
+}
+void TouchArtistInfo(const QString &id) {
+	auto &order = ArtistInfoOrder();
+	const auto i = std::find(order.begin(), order.end(), id);
+	if (i != order.end()) {
+		order.erase(i);
+	}
+	order.push_back(id);
+}
+void InsertArtistInfo(const QString &id, ArtistInfo info) {
+	auto &cache = ArtistInfoCache();
+	cache[id] = std::move(info);
+	TouchArtistInfo(id);
+	while (ArtistInfoOrder().size() > kArtistInfoCacheCount) {
+		cache.erase(ArtistInfoOrder().front());
+		ArtistInfoOrder().pop_front();
+	}
+}
 
 [[nodiscard]] std::map<QString, std::vector<Fn<void(ArtistInfo)>>> &PendingArtistInfo() {
 	static auto result = std::map<QString, std::vector<Fn<void(ArtistInfo)>>>();
@@ -520,24 +597,110 @@ void ApiGet(
 	if (!ValidTrackId(track.id)) {
 		return QString();
 	}
-	return CacheDir() + '/' + track.id + '.' + track.extension;
+	// Разные варианты потока могут иметь одинаковое расширение.
+	const auto stream = QUrl(track.transcodingUrl).toEncoded(
+		QUrl::RemoveQuery | QUrl::RemoveFragment);
+	const auto key = QCryptographicHash::hash(stream, QCryptographicHash::Sha256)
+		.toHex()
+		.left(16);
+	return CacheDir() + '/' + track.id + '.'
+		+ QString::fromLatin1(key) + '.' + track.extension;
+}
+
+[[nodiscard]] QString LegacyAudioPath(const QString &id) {
+	const auto prefix = CacheDir() + '/' + id + '.';
+	for (const auto &extension : { u"m4a"_q, u"mp3"_q }) {
+		const auto file = QFileInfo(prefix + extension);
+		if (file.isFile() && file.size() > 0) {
+			return file.filePath();
+		}
+	}
+	return {};
+}
+
+// Отмечаем file как недавно использованный: mtime служит ключом LRU.
+void TouchCacheFile(const QString &path) {
+	QFile file(path);
+	if (file.open(QIODevice::ReadWrite)) {
+		file.setFileTime(QDateTime::currentDateTime(), QFileDevice::FileModificationTime);
+	}
+}
+
+// Держим кэш в пределах квоты, удаляя самые давно использованные треки.
+// QDir::Time ставит новые файлы первыми, поэтому сверх квоты удаляются старые.
+// protectPath (только что скачанный трек) всегда остаётся.
+void TrimAudioCache(const QString &protectPath) {
+	const auto dir = QDir(CacheDir());
+	const auto files = dir.entryInfoList(
+		{ u"*.m4a"_q, u"*.mp3"_q, u"yt-*.webm"_q }, QDir::Files, QDir::Time);
+	auto total = QFileInfo(protectPath).size();
+	auto count = 1;
+	for (const auto &file : files) {
+		if (file.absoluteFilePath() == protectPath) {
+			continue;
+		}
+		if (count < kAudioCacheFiles
+			&& total + file.size() <= kAudioCacheBytes) {
+			++count;
+			total += file.size();
+			continue;
+		}
+		QFile::remove(file.absoluteFilePath());
+	}
 }
 
 void FinishFile(
 		const QString &path,
-		const QByteArray &bytes,
+		const std::vector<QByteArray> &parts,
 		Fn<void(const QString &, const QString &)> done) {
 	QDir().mkpath(CacheDir());
-	auto file = QFile(path + u".part"_q);
-	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
-		|| file.write(bytes) != bytes.size()) {
-		done({}, QString::fromUtf8(Mogram::Lang::Tr("не удалось записать файл")));
-		return;
+	auto file = QSaveFile(path);
+	if (file.open(QIODevice::WriteOnly)) {
+		const auto written = std::all_of(parts.begin(), parts.end(), [&](const QByteArray &part) {
+			return file.write(part) == part.size();
+		});
+		if (written && file.commit()) {
+			done(path, QString());
+			return;
+		}
 	}
-	file.close();
-	QFile::remove(path);
-	file.rename(path);
-	done(path, QString());
+	done({}, QString::fromUtf8(Mogram::Lang::Tr("не удалось записать файл")));
+}
+
+struct HlsDownload {
+	QString path;
+	QStringList urls;
+	std::vector<QByteArray> parts;
+	Fn<void(const QString &, const QString &)> done;
+	qsizetype next = 0;
+	qsizetype received = 0;
+	qint64 bytes = 0;
+};
+
+void DownloadHlsSegment(const std::shared_ptr<HlsDownload> &job) {
+	const auto index = job->next++;
+	const auto reply = Get(QUrl(job->urls[index]), kMaxAudioBytes);
+	QObject::connect(reply, &QNetworkReply::finished, [=] {
+		reply->deleteLater();
+		if (!job->done) {
+			return;
+		}
+		auto part = reply->readAll();
+		job->bytes += part.size();
+		if (reply->error() != QNetworkReply::NoError
+			|| part.isEmpty()
+			|| job->bytes > kMaxAudioBytes) {
+			const auto done = std::exchange(job->done, {});
+			done({}, QString::fromUtf8(Mogram::Lang::Tr("сбой загрузки сегмента")));
+			return;
+		}
+		job->parts[index] = std::move(part);
+		if (++job->received == job->urls.size()) {
+			FinishFile(job->path, job->parts, std::exchange(job->done, {}));
+		} else if (job->next < job->urls.size()) {
+			DownloadHlsSegment(job);
+		}
+	});
 }
 
 // Скачивает HLS: init-сегмент (EXT-X-MAP) и сегменты по порядку, склеивает в один файл.
@@ -584,29 +747,17 @@ void DownloadHls(
 			done({}, QString::fromUtf8(Mogram::Lang::Tr("слишком большой плейлист")));
 			return;
 		}
-		const auto buffer = std::make_shared<QByteArray>();
-		const auto next = std::make_shared<Fn<void(int)>>();
-		*next = [=](int index) {
-			if (index >= parts.size()) {
-				FinishFile(path, *buffer, done);
-				return;
-			}
-			const auto segment = Get(QUrl(parts[index]), kMaxAudioBytes);
-			QObject::connect(segment, &QNetworkReply::finished, [=] {
-				const auto ok = (segment->error() == QNetworkReply::NoError);
-				if (ok) {
-					buffer->append(segment->readAll());
-				}
-				segment->deleteLater();
-				// Общий размер склейки ограничен так же, как обычная загрузка.
-				if (!ok || buffer->size() > kMaxAudioBytes) {
-					done({}, QString::fromUtf8(Mogram::Lang::Tr("сбой загрузки сегмента")));
-					return;
-				}
-				(*next)(index + 1);
-			});
-		};
-		(*next)(0);
+		const auto job = std::make_shared<HlsDownload>();
+		job->path = path;
+		job->parts.resize(parts.size());
+		job->urls = std::move(parts);
+		job->done = done;
+		const auto concurrent = std::min<qsizetype>(
+			kConcurrentHlsSegments,
+			job->urls.size());
+		for (auto i = qsizetype(0); i != concurrent; ++i) {
+			DownloadHlsSegment(job);
+		}
 	});
 }
 
@@ -631,6 +782,54 @@ int &ActiveImageRequests() {
 	return result;
 }
 
+// Порядок обращений к кэшу обложек: конец deque = недавно использованный.
+[[nodiscard]] std::deque<QString> &ImageOrder() {
+	static auto result = std::deque<QString>();
+	return result;
+}
+
+qint64 &ImageCacheBytes() {
+	static auto result = qint64(0);
+	return result;
+}
+
+void TouchImage(const QString &url) {
+	auto &order = ImageOrder();
+	const auto i = std::find(order.begin(), order.end(), url);
+	if (i != order.end()) {
+		order.erase(i);
+	}
+	order.push_back(url);
+}
+
+void TrimImageCache() {
+	auto &cache = ImageCache();
+	auto &order = ImageOrder();
+	while (!order.empty()
+		&& (order.size() > kImageCacheCount
+			|| ImageCacheBytes() > kImageCacheBytes)) {
+		const auto url = std::move(order.front());
+		order.pop_front();
+		if (const auto i = cache.find(url); i != cache.end()) {
+			ImageCacheBytes() -= i->second.sizeInBytes();
+			cache.erase(i);
+		}
+	}
+}
+
+void InsertImage(const QString &url, QImage image) {
+	auto &cache = ImageCache();
+	if (const auto i = cache.find(url); i != cache.end()) {
+		ImageCacheBytes() -= i->second.sizeInBytes();
+		i->second = std::move(image);
+	} else {
+		cache.emplace(url, std::move(image));
+	}
+	ImageCacheBytes() += cache[url].sizeInBytes();
+	TouchImage(url);
+	TrimImageCache();
+}
+
 [[nodiscard]] ImageCallbacks &PendingImages() {
 	static auto result = ImageCallbacks();
 	return result;
@@ -640,11 +839,7 @@ void StartQueuedImageLoads();
 
 void FinishImageRequest(const QString &url, QImage image) {
 	if (!image.isNull()) {
-		auto &cache = ImageCache();
-		if (cache.size() > 300) {
-			cache.clear();
-		}
-		cache[url] = image;
+		InsertImage(url, image);
 	}
 	ActiveImageRequests() = std::max(ActiveImageRequests() - 1, 0);
 	auto callbacks = std::vector<Fn<void(QImage)>>();
@@ -660,11 +855,17 @@ void FinishImageRequest(const QString &url, QImage image) {
 }
 
 void LoadImageAttempt(const QString &url, int attempt) {
+	++ActiveImageRequests();
 	const auto reply = Get(QUrl(url), kMaxImageBytes, QString(), 5000);
 	QObject::connect(reply, &QNetworkReply::finished, [=] {
-		auto image = QImage::fromData(reply->readAll());
+		const auto bytes = reply->readAll();
+		auto image = QImage::fromData(bytes);
 		reply->deleteLater();
 		if (image.isNull() && attempt == 0) {
+			// Освобождаем слот перед повтором: retry сам его займёт заново.
+			// Иначе после нескольких неудач StartQueuedImageLoads встанет и
+			// остальные обложки никогда не начнут грузиться.
+			ActiveImageRequests() = std::max(ActiveImageRequests() - 1, 0);
 			QTimer::singleShot(400, QCoreApplication::instance(), [=] {
 				LoadImageAttempt(url, 1);
 			});
@@ -682,7 +883,6 @@ void StartQueuedImageLoads() {
 		if (PendingImages().find(url) == PendingImages().end()) {
 			continue;
 		}
-		++ActiveImageRequests();
 		LoadImageAttempt(url, 0);
 	}
 }
@@ -692,6 +892,7 @@ void StartQueuedImageLoads() {
 void LoadImage(const QString &url, Fn<void(QImage)> done) {
 	const auto &cache = ImageCache();
 	if (const auto i = cache.find(url); i != cache.end()) {
+		TouchImage(url);
 		done(i->second);
 		return;
 	}
@@ -714,12 +915,60 @@ std::map<uint64, QImage> &Covers() {
 	static auto result = std::map<uint64, QImage>();
 	return result;
 }
+std::deque<uint64> &CoverOrder() {
+	static auto result = std::deque<uint64>();
+	return result;
+}
+qint64 &CoversBytes() {
+	static auto result = qint64(0);
+	return result;
+}
+void TrimCovers() {
+	auto &covers = Covers();
+	auto &order = CoverOrder();
+	while (!order.empty()
+		&& (order.size() > kCoverCacheCount
+			|| CoversBytes() > kCoverCacheBytes)) {
+		const auto id = order.front();
+		order.pop_front();
+		if (const auto i = covers.find(id); i != covers.end()) {
+			CoversBytes() -= i->second.sizeInBytes();
+			covers.erase(i);
+		}
+	}
+}
+void InsertCover(uint64 documentId, QImage image) {
+	auto &covers = Covers();
+	if (const auto i = covers.find(documentId); i != covers.end()) {
+		CoversBytes() -= i->second.sizeInBytes();
+		i->second = std::move(image);
+	} else {
+		covers.emplace(documentId, std::move(image));
+	}
+	CoversBytes() += covers[documentId].sizeInBytes();
+	auto &order = CoverOrder();
+	const auto j = std::find(order.begin(), order.end(), documentId);
+	if (j != order.end()) {
+		order.erase(j);
+	}
+	order.push_back(documentId);
+	TrimCovers();
+}
 } // namespace
 
 QImage CoverForDocument(uint64 documentId) {
 	const auto &covers = Covers();
 	const auto i = covers.find(documentId);
-	return (i != covers.end()) ? i->second : QImage();
+	if (i == covers.end()) {
+		return QImage();
+	}
+	auto &order = CoverOrder();
+	const auto j = std::find(order.begin(), order.end(), documentId);
+	if (j != order.end()) {
+		order.erase(j);
+		order.push_back(documentId);
+	}
+	return i->second;
 }
 
 namespace {
@@ -730,7 +979,7 @@ rpl::event_stream<> &CoversStream() {
 } // namespace
 
 void SetCover(uint64 documentId, QImage image) {
-	Covers()[documentId] = std::move(image);
+	InsertCover(documentId, std::move(image));
 	CoversStream().fire({});
 }
 
@@ -739,7 +988,17 @@ rpl::producer<> CoversChanged() {
 }
 
 uint64 DocumentIdForTrack(const QString &trackId) {
-	const auto id = trackId.toULongLong();
+	auto id = trackId.toULongLong();
+	if (!id && trackId.startsWith(u"yt:"_q)) {
+		// У ролика YouTube Music нет числового SoundCloud id: берём
+		// устойчивый хеш, чтобы документ и обложка были одни на трек.
+		auto hash = 1469598103934665603ULL;
+		for (const auto byte : trackId.toUtf8()) {
+			hash ^= uchar(byte);
+			hash *= 1099511628211ULL;
+		}
+		id = hash & ((1ULL << 56) - 1);
+	}
 	// Префикс занимает старшие биты: слишком длинный id переполнит сумму.
 	if (id >= (1ULL << 56)) {
 		return 0;
@@ -786,11 +1045,11 @@ void Resolve(
 		QUrlQuery(),
 		[=](QByteArray data, QString error) {
 			if (!error.isEmpty()) {
-				done(track, error);
+				done(track, LegacyAudioPath(track.id).isEmpty() ? error : QString());
 				return;
 			}
 			auto fresh = ParseTrack(QJsonDocument::fromJson(data).object());
-			if (fresh.transcodingUrl.isEmpty()) {
+			if (fresh.transcodingUrl.isEmpty() && LegacyAudioPath(track.id).isEmpty()) {
 				done(track, QString::fromUtf8(Mogram::Lang::Tr("трек недоступен (закрыт или удалён)")));
 				return;
 			}
@@ -867,6 +1126,7 @@ void LoadArtistInfo(
 	}
 	if (const auto i = ArtistInfoCache().find(userId);
 		i != ArtistInfoCache().end()) {
+		TouchArtistInfo(userId);
 		done(i->second);
 		return;
 	}
@@ -884,7 +1144,7 @@ void LoadArtistInfo(
 				? ParseArtistInfo(QJsonDocument::fromJson(data).object(), userId)
 				: ArtistInfo();
 			if (!info.id.isEmpty()) {
-				ArtistInfoCache()[userId] = info;
+				InsertArtistInfo(userId, info);
 			}
 			auto callbacks = std::move(PendingArtistInfo()[userId]);
 			PendingArtistInfo().erase(userId);
@@ -892,6 +1152,80 @@ void LoadArtistInfo(
 				callback(info);
 			}
 		});
+}
+
+QStringList TrackArtistNames(const Track &track) {
+	const auto credit = track.artist.trimmed();
+	if (credit.isEmpty()) {
+		return {};
+	}
+	if (!ValidTrackId(track.id) || credit.compare(track.uploaderName, Qt::CaseInsensitive) == 0) {
+		return { credit };
+	}
+	static const auto separator = QRegularExpression(
+		u"\\s*,\\s*|\\s+(?:feat\\.?|ft\\.?)\\s+"_q,
+		QRegularExpression::CaseInsensitiveOption);
+	auto result = QStringList();
+	auto seen = std::set<QString>();
+	for (const auto &part : credit.split(separator, Qt::SkipEmptyParts)) {
+		const auto name = part.trimmed();
+		if (!name.isEmpty() && seen.insert(name.toCaseFolded()).second) {
+			result.push_back(name);
+		}
+	}
+	return result.empty() ? QStringList{ credit } : result;
+}
+
+void ResolveTrackArtist(
+		const Track &track,
+		const QString &name,
+		Fn<void(ArtistInfo)> done) {
+	const auto matches = [target = name.simplified()](const QString &candidate) {
+		return candidate.simplified().compare(target, Qt::CaseInsensitive) == 0;
+	};
+	const auto findByName = [=] {
+		auto query = QUrlQuery();
+		query.addQueryItem(u"q"_q, name);
+		query.addQueryItem(u"limit"_q, QString::number(kPageSize));
+		query.addQueryItem(u"linked_partitioning"_q, u"1"_q);
+		ApiGet(QString::fromLatin1(kApi) + u"/search/users"_q, std::move(query), [=](
+				QByteArray data,
+				QString error) {
+			auto best = ArtistInfo();
+			auto bestRank = std::pair(false, qint64(0));
+			if (error.isEmpty()) {
+				const auto collection = QJsonDocument::fromJson(data).object().value("collection").toArray();
+				for (const auto &value : collection) {
+					const auto object = value.toObject();
+					if (!matches(object.value("username").toString())) {
+						continue;
+					}
+					auto artist = ParseArtistInfo(object, QString());
+					const auto rank = std::pair(
+						object.value("verified").toBool(),
+						object.value("followers_count").toVariant().toLongLong());
+					if (!artist.id.isEmpty() && (best.id.isEmpty() || rank > bestRank)) {
+						best = std::move(artist);
+						bestRank = rank;
+					}
+				}
+			}
+			done(std::move(best));
+		});
+	};
+	if (ValidTrackId(track.artistId) && track.uploaderName.isEmpty()) {
+		LoadArtistInfo(track.artistId, [=](ArtistInfo info) {
+			if (!info.id.isEmpty() && matches(info.name)) {
+				done(std::move(info));
+			} else {
+				findByName();
+			}
+		});
+	} else if (ValidTrackId(track.artistId) && matches(track.uploaderName)) {
+		done({ track.artistId, track.uploaderName, track.artistArtworkUrl, {} });
+	} else {
+		findByName();
+	}
 }
 
 void SearchLimited(
@@ -906,24 +1240,67 @@ void SearchLimited(
 
 namespace {
 
+[[nodiscard]] QString AlbumArtworkKey(const QString &url) {
+	const auto parsed = QUrl(url);
+	const auto path = parsed.path();
+	static const auto variant = QRegularExpression(
+		u"-(?:large|original|small|tiny|badge|crop|mini|t[0-9]+x[0-9]+)\\.[^.]+$"_q);
+	const auto match = variant.match(path);
+	return match.hasMatch()
+		? path.left(match.capturedStart())
+		: parsed.adjusted(QUrl::RemoveQuery | QUrl::RemoveFragment).toString();
+}
+
+[[nodiscard]] bool IsAlbumBackdrop(const QString &url, const QString &primaryKey) {
+	return SafeMediaUrl(QUrl(url)) && AlbumArtworkKey(url) != primaryKey;
+}
+
 [[nodiscard]] Album ParseAlbum(const QJsonObject &object) {
 	auto result = Album();
 	result.id = QString::number(object.value("id").toVariant().toLongLong());
 	result.title = object.value("title").toString();
 	const auto user = object.value("user").toObject();
 	result.artist = user.value("username").toString();
+	result.artistId = QString::number(user.value("id").toVariant().toLongLong());
+	const auto tracks = object.value("tracks").toArray();
 	result.artworkUrl = object.value("artwork_url").toString();
-	if (result.artworkUrl.isEmpty()) {
-		const auto tracks = object.value("tracks").toArray();
-		if (!tracks.isEmpty()) {
-			result.artworkUrl = tracks.first().toObject()
-				.value("artwork_url").toString();
-		}
+	if (result.artworkUrl.isEmpty() && !tracks.isEmpty()) {
+		result.artworkUrl = tracks.first().toObject().value("artwork_url").toString();
 	}
 	if (result.artworkUrl.isEmpty()) {
 		result.artworkUrl = user.value("avatar_url").toString();
 	}
 	result.trackCount = object.value("track_count").toInt();
+	const auto type = object.value("set_type").toString(
+		object.value("playlist_type").toString()).trimmed().toLower();
+	if (type == u"single"_q) {
+		result.releaseKind = ReleaseKind::Single;
+	} else if (type == u"ep"_q) {
+		result.releaseKind = ReleaseKind::Ep;
+	} else if (type == u"compilation"_q) {
+		result.releaseKind = ReleaseKind::Compilation;
+	} else if (type == u"album"_q || (type.isEmpty() && object.value("is_album").toBool())) {
+		result.releaseKind = ReleaseKind::Album;
+	}
+	result.releaseYear = object.value("release_year").toInt();
+	if (result.releaseYear <= 0) {
+		const auto releaseDate = object.value("release_date").toString();
+		result.releaseYear = releaseDate.left(4).toInt();
+	}
+	const auto primaryKey = AlbumArtworkKey(result.artworkUrl);
+	auto complete = tracks.size() >= result.trackCount;
+	for (const auto &value : tracks) {
+		const auto track = value.toObject();
+		const auto url = track.value("artwork_url").toString();
+		if (IsAlbumBackdrop(url, primaryKey)) {
+			result.backdropArtworkUrl = url;
+			return result;
+		}
+		complete = complete && track.contains("artwork_url");
+	}
+	if (complete) {
+		result.backdropArtworkUrl = QString();
+	}
 	return result;
 }
 
@@ -988,6 +1365,118 @@ void HydrateTracks(
 }
 
 } // namespace
+
+void SearchCatalog(
+		const QString &query,
+		SearchCategory category,
+		Fn<void(std::vector<CatalogItem>, QString)> done) {
+	auto path = u"/search"_q;
+	switch (category) {
+	case SearchCategory::All: break;
+	case SearchCategory::Tracks: path += u"/tracks"_q; break;
+	case SearchCategory::Playlists: path += u"/playlists_without_albums"_q; break;
+	case SearchCategory::Albums: path += u"/albums"_q; break;
+	case SearchCategory::Artists: path += u"/users"_q; break;
+	}
+	auto q = QUrlQuery();
+	q.addQueryItem(u"q"_q, query);
+	q.addQueryItem(u"limit"_q, QString::number(kPageSize));
+	q.addQueryItem(u"linked_partitioning"_q, u"1"_q);
+	ApiGet(QString::fromLatin1(kApi) + path, std::move(q), [=](
+			QByteArray data,
+			QString error) {
+		auto items = std::vector<CatalogItem>();
+		if (error.isEmpty()) {
+			const auto collection = QJsonDocument::fromJson(data).object().value("collection");
+			if (!collection.isArray()) {
+				error = QString::fromUtf8(Mogram::Lang::Tr("Не удалось загрузить результаты поиска SoundCloud."));
+			} else {
+				auto seen = std::set<std::pair<QString, QString>>();
+				for (const auto &value : collection.toArray()) {
+					const auto object = value.toObject();
+					const auto kind = object.value("kind").toString();
+					const auto id = ResourceId(object, u"id"_q);
+					if (id.isEmpty() || !seen.emplace(kind, id).second) {
+						continue;
+					}
+					if (kind == u"track"_q) {
+						auto track = ParseTrack(object);
+						if (!track.title.isEmpty() && !track.transcodingUrl.isEmpty()) {
+							items.push_back(std::move(track));
+						}
+					} else if (kind == u"playlist"_q || kind == u"album"_q) {
+						auto album = ParseAlbum(object);
+						album.id = id;
+						if (kind == u"album"_q || category == SearchCategory::Albums) {
+							if (album.releaseKind == ReleaseKind::Unknown) {
+								album.releaseKind = ReleaseKind::Album;
+							}
+						}
+						if (!album.title.isEmpty() && album.trackCount > 0) {
+							items.push_back(std::move(album));
+						}
+					} else if (kind == u"user"_q) {
+						auto artist = ParseArtistInfo(object, id);
+						if (!artist.name.isEmpty()) {
+							items.push_back(std::move(artist));
+						}
+					}
+				}
+			}
+		}
+		if (category != SearchCategory::All || !error.isEmpty()) {
+			done(std::move(items), std::move(error));
+			return;
+		}
+		struct SupplementalResults {
+			std::vector<CatalogItem> items;
+			std::array<std::vector<CatalogItem>, 2> sets;
+			int pending = 0;
+		};
+		const auto hasSet = [&](bool playlist) {
+			return std::ranges::any_of(items, [=](const CatalogItem &item) {
+				const auto album = std::get_if<Album>(&item);
+				return album && (album->releaseKind == ReleaseKind::Unknown) == playlist;
+			});
+		};
+		const auto missingPlaylist = !hasSet(true);
+		const auto missingAlbum = !hasSet(false);
+		if (!missingPlaylist && !missingAlbum) {
+			done(std::move(items), {});
+			return;
+		}
+		// Общая выдача может полностью состоять из треков и профилей.
+		// Добавляем верхние результаты из отсутствующих категорий.
+		const auto state = std::make_shared<SupplementalResults>();
+		state->items = std::move(items);
+		state->pending = int(missingPlaylist) + int(missingAlbum);
+		const auto request = [=](SearchCategory kind, int index) {
+			SearchCatalog(query, kind, [=](std::vector<CatalogItem> sets, QString) {
+				state->sets[index] = std::move(sets);
+				if (--state->pending != 0) {
+					return;
+				}
+				auto position = std::min(size_t(2), state->items.size());
+				for (auto i = 0; i != 2; ++i) {
+					for (auto &list : state->sets) {
+						if (i < int(list.size())) {
+							state->items.insert(
+								state->items.begin() + position++,
+								std::move(list[i]));
+						}
+					}
+				}
+				done(std::move(state->items), {});
+			});
+		};
+		if (missingPlaylist) {
+			request(SearchCategory::Playlists, 0);
+		}
+		if (missingAlbum) {
+			request(SearchCategory::Albums, 1);
+		}
+	});
+}
 
 void SearchAlbums(
 		const QString &query,
@@ -1146,9 +1635,55 @@ void AlbumTracks(
 		});
 }
 
+void LoadAlbumBackdrop(const Album &album, Fn<void(QString)> done) {
+	if (album.backdropArtworkUrl || !ValidTrackId(album.id)) {
+		done(album.backdropArtworkUrl.value_or(QString()));
+		return;
+	}
+	AlbumTracks(album.id, [=, primaryKey = AlbumArtworkKey(album.artworkUrl)](
+			std::vector<Track> tracks,
+			QString error) {
+		if (error.isEmpty()) {
+			for (const auto &track : tracks) {
+				if (track.artworkUrl != track.artistArtworkUrl
+					&& IsAlbumBackdrop(track.artworkUrl, primaryKey)) {
+					done(track.artworkUrl);
+					return;
+				}
+			}
+		}
+		done({});
+	});
+}
+
 QString CacheDir() {
 	return QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
 		+ u"/mogram_music"_q;
+}
+
+void LoadCachedAudio(
+		const QString &key,
+		const QString &cachedPath,
+		Fn<void(AudioFileDone)> load,
+		AudioFileDone done) {
+	const auto cached = QFileInfo(cachedPath);
+	if (cached.isFile() && cached.size() > 0) {
+		TouchCacheFile(cachedPath);
+		done(cachedPath, {});
+		return;
+	}
+	static auto loading = std::map<QString, std::vector<AudioFileDone>>();
+	const auto [entry, started] = loading.try_emplace(key);
+	entry->second.push_back(std::move(done));
+	if (!started) return;
+	load([key](const QString &path, const QString &error) {
+		if (!path.isEmpty() && error.isEmpty()) {
+			TouchCacheFile(path);
+			TrimAudioCache(path);
+		}
+		const auto result = loading.extract(key);
+		for (const auto &callback : result.mapped()) callback(path, error);
+	});
 }
 
 void Search(
@@ -1183,64 +1718,41 @@ void Search(
 		});
 }
 
-void Download(
-		const Track &track,
-		Fn<void(const QString &path, const QString &error)> done) {
+namespace {
+
+void DownloadStream(const Track &track, AudioFileDone done) {
 	const auto path = CachePath(track);
-	if (path.isEmpty()) {
-		done({}, QString::fromUtf8(Mogram::Lang::Tr("некорректный id трека")));
-		return;
-	}
-	if (QFile::exists(path)) {
+	const auto cached = QFileInfo(path);
+	if (cached.isFile() && cached.size() > 0) {
 		done(path, QString());
 		return;
 	}
-	// Один и тот же трек могут просить предзагрузка следующего и предзагрузка
-	// хвоста очереди: качаем файл один раз, остальным отдаём тот же результат.
-	using Waiters = std::vector<Fn<void(const QString &, const QString &)>>;
-	static auto loading = std::map<QString, Waiters>();
-	if (const auto i = loading.find(path); i != loading.end()) {
-		i->second.push_back(std::move(done));
-		return;
-	}
-	loading[path].push_back(std::move(done));
-	const auto finish = [=](const QString &result, const QString &error) {
-		const auto i = loading.find(path);
-		if (i != loading.end()) {
-			// Колбэки могут снова зайти в Download: забираем список заранее.
-			auto waiters = std::move(i->second);
-			loading.erase(i);
-			for (const auto &waiter : waiters) {
-				waiter(result, error);
-			}
-		}
-	};
 	auto q = QUrlQuery();
 	if (!track.authorization.isEmpty()) {
 		q.addQueryItem(u"track_authorization"_q, track.authorization);
 	}
 	// Ссылка на транскодинг пришла из ответа API: проверяем перед загрузкой.
 	if (!SafeMediaUrl(QUrl(track.transcodingUrl))) {
-		finish({}, QString::fromUtf8(Mogram::Lang::Tr("сервер вернул недопустимую ссылку")));
+		done({}, QString::fromUtf8(Mogram::Lang::Tr("сервер вернул недопустимую ссылку")));
 		return;
 	}
 	ApiGet(track.transcodingUrl, q, [=](QByteArray data, QString error) {
 		if (!error.isEmpty()) {
-			finish({}, error);
+			done({}, error);
 			return;
 		}
 		const auto url = QJsonDocument::fromJson(data).object()
 			.value("url").toString();
 		if (url.isEmpty()) {
-			finish({}, QString::fromUtf8(Mogram::Lang::Tr("нет ссылки на поток")));
+			done({}, QString::fromUtf8(Mogram::Lang::Tr("нет ссылки на поток")));
 			return;
 		}
 		if (!SafeMediaUrl(QUrl(url))) {
-			finish({}, QString::fromUtf8(Mogram::Lang::Tr("сервер вернул недопустимую ссылку")));
+			done({}, QString::fromUtf8(Mogram::Lang::Tr("сервер вернул недопустимую ссылку")));
 			return;
 		}
 		if (track.hls) {
-			DownloadHls(url, path, finish);
+			DownloadHls(url, path, done);
 			return;
 		}
 		const auto reply = Get(QUrl(url), kMaxAudioBytes);
@@ -1248,13 +1760,81 @@ void Download(
 			const auto bytes = reply->readAll();
 			const auto failed = (reply->error() != QNetworkReply::NoError);
 			reply->deleteLater();
-			if (failed) {
-				finish({}, QString::fromUtf8(Mogram::Lang::Tr("сбой загрузки трека")));
+			if (failed || bytes.isEmpty()) {
+				done({}, QString::fromUtf8(Mogram::Lang::Tr("сбой загрузки трека")));
 				return;
 			}
-			FinishFile(path, bytes, finish);
+			FinishFile(path, { bytes }, done);
 		});
 	});
+}
+
+void TryDownloadStreams(
+		const Track &track,
+		const std::shared_ptr<std::vector<TrackStream>> &streams,
+		size_t index,
+		const QString &firstError,
+		AudioFileDone done) {
+	if (index == streams->size()) {
+		const auto path = LegacyAudioPath(track.id);
+		if (!path.isEmpty()) {
+			done(path, QString());
+			return;
+		}
+		done({}, firstError);
+		return;
+	}
+	const auto &stream = (*streams)[index];
+	auto candidate = track;
+	candidate.transcodingUrl = stream.url;
+	candidate.extension = stream.extension;
+	candidate.hls = stream.hls;
+	DownloadStream(candidate, [=](const QString &path, const QString &error) {
+		if (error.isEmpty()) {
+			done(path, error);
+		} else {
+			TryDownloadStreams(track, streams, index + 1, firstError, done);
+		}
+	});
+}
+
+} // namespace
+
+void Download(const Track &track, AudioFileDone done) {
+	const auto path = CachePath(track);
+	if (path.isEmpty()) {
+		done({}, QString::fromUtf8(Mogram::Lang::Tr("некорректный id трека")));
+		return;
+	}
+	const auto cached = track.transcodingUrl.isEmpty() ? LegacyAudioPath(track.id) : path;
+	LoadCachedAudio(path, cached, [=](AudioFileDone finish) {
+		DownloadStream(track, [=](const QString &result, const QString &firstError) {
+			if (firstError.isEmpty()) {
+				finish(result, firstError);
+				return;
+			}
+			ApiGet(QString::fromLatin1(kApi) + u"/tracks/"_q + track.id,
+				QUrlQuery(),
+				[=](QByteArray data, QString error) {
+					const auto fresh = QJsonDocument::fromJson(data).object();
+					auto streams = error.isEmpty()
+						? ParseStreams(fresh)
+						: std::vector<TrackStream>();
+					auto refreshed = track;
+					refreshed.authorization = fresh.value("track_authorization").toString();
+					if (refreshed.authorization == track.authorization) {
+						std::erase_if(streams, [&](const TrackStream &stream) {
+							return stream.url == track.transcodingUrl;
+						});
+					}
+					TryDownloadStreams(refreshed,
+						std::make_shared<std::vector<TrackStream>>(std::move(streams)),
+						0,
+						firstError,
+						finish);
+				});
+		});
+	}, std::move(done));
 }
 
 namespace {
@@ -1943,8 +2523,9 @@ void SetTrackLiked(const QString &trackId, bool liked, bool refreshed) {
 			QNetworkReply::NetworkError networkError,
 			QString networkMessage,
 			QByteArray data) {
-		if (status == 401 && !refreshed) {
-			// Токен входа живёт сутки: берём свежий из браузера и повторяем.
+		if ((status == 401 || status == 403) && !refreshed) {
+			// Сайт может отклонять устаревшую авторизацию и через 403.
+			// Обновляем один раз, чтобы не зациклить запрещённый запрос.
 			RefreshSoundCloudToken([=](bool ok) {
 				if (ok) {
 					SetTrackLiked(trackId, liked, true);
@@ -1969,12 +2550,12 @@ void SetTrackLiked(const QString &trackId, bool liked, bool refreshed) {
 		LikeWriteErrorsStream().fire(std::move(message));
 	};
 	auto request = QNetworkRequest(QUrl(QString::fromLatin1(kPublicApi)
-		+ u"/likes/tracks/"_q + trackId));
+		+ u"/likes/tracks/soundcloud:tracks:"_q + trackId));
 	request.setRawHeader("User-Agent", kUserAgent);
 	request.setRawHeader(
 		"Authorization",
 		QByteArray("OAuth ") + AccountToken().toUtf8());
-	// Без браузерных заголовков запись лайка упирается в защиту DataDome (403).
+	// Заголовки запроса записи совпадают с запросами сайта.
 	request.setRawHeader("Accept", "application/json, text/javascript, */*; q=0.01");
 	request.setRawHeader("Accept-Language", "en-US,en;q=0.5");
 	request.setRawHeader("Content-Type", "application/json");
@@ -1994,6 +2575,7 @@ void SetTrackLiked(const QString &trackId, bool liked, bool refreshed) {
 		const auto networkMessage = reply->errorString();
 		const auto data = reply->readAll();
 		reply->deleteLater();
+		LOG(("[moka-dbg] like %1 primary HTTP %2 err %3 body %4").arg(trackId).arg(status).arg(networkMessage.left(120)).arg(QString::fromUtf8(data.left(200))));
 		if (status >= 200 && status < 300) {
 			return;
 		}
@@ -2038,6 +2620,7 @@ void SetTrackLiked(const QString &trackId, bool liked, bool refreshed) {
 				const auto legacyMessage = legacyReply->errorString();
 				const auto legacyData = legacyReply->readAll();
 				legacyReply->deleteLater();
+				LOG(("[moka-dbg] like %1 legacy HTTP %2 err %3 body %4").arg(trackId).arg(legacyStatus).arg(legacyMessage.left(120)).arg(QString::fromUtf8(legacyData.left(200))));
 				if (legacyStatus >= 200 && legacyStatus < 300) {
 					return;
 				}
@@ -2051,7 +2634,7 @@ void SetTrackLiked(const QString &trackId, bool liked, bool refreshed) {
 						: primaryNetworkMessage,
 					legacyData.isEmpty() ? primaryData : legacyData);
 			});
-		}, false);
+		}, refreshed);
 	});
 }
 
@@ -2128,6 +2711,7 @@ void SyncLikes(
 				if (track.id.isEmpty() || remoteIds.contains(track.id)) {
 					continue;
 				}
+				LOG(("[moka-dbg] push like %1 %2").arg(track.id).arg(track.title.left(30)));
 				SetTrackLiked(track.id, true);
 				++pushed;
 			}
