@@ -29,6 +29,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mogram/passcode/mogram_fake_passcode.h"
 #include "mogram/ghost/mogram_ghost.h"
 #include "mogram/misc/mogram_misc.h"
+#include "mogram/link/mogram_link.h"
 #include "mogram/saveinator/mogram_saveinator.h"
 #include "mogram/update/mogram_update.h"
 
@@ -375,6 +376,7 @@ void Application::run() {
 	Mogram::Tweaks::RegisterSettings();
 	Mogram::PasscodeGuard::Init();
 	Mogram::Misc::RegisterSettings();
+	Mogram::Link::RegisterSettings();
 	Mogram::Appearance::RegisterSettings();
 	Mogram::Effects::RegisterSettings();
 	Mogram::Gradient::RegisterSettings(); // Mogram: animated gradient background.
@@ -634,6 +636,7 @@ void Application::showOpenGLCrashNotification() {
 
 void Application::startDomain() {
 	const auto state = _domain->start(QByteArray());
+	Mogram::Link::Start(); // Mogram: Mogram Link
 	if (state != Storage::StartResult::IncorrectPasscodeLegacy) {
 		// In case of non-legacy passcoded app all global settings are ready.
 		startSettingsAndBackground();

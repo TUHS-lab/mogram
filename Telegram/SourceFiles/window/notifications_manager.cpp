@@ -46,6 +46,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/text/text_utilities.h"
 #include "platform/platform_specific.h"
 #include "mogram/streamer/mogram_streamer.h"
+#include "mogram/link/mogram_link.h"
 
 #include <QtGui/QWindow>
 #include <QtGui/QGuiApplication>
@@ -439,7 +440,8 @@ void System::schedule(Data::ItemNotification notification) {
 	const auto type = notification.type;
 	const auto thread = item->notificationThread();
 	const auto skip = skipNotification(notification);
-	if (skip.value == SkipState::Skip) {
+	if (skip.value == SkipState::Skip
+		|| Mogram::Link::ActiveElsewhere(item->history()->peer->id.value)) { // Mogram Link: читают на телефоне
 		thread->popNotification(notification);
 		return;
 	}

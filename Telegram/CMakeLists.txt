@@ -156,6 +156,8 @@ PRIVATE
     mogram/music/mogram_island_glyphs.h
     mogram/music/mogram_music_ui.cpp
     mogram/music/mogram_music_ui.h
+    mogram/link/mogram_link.cpp
+    mogram/link/mogram_link.h
     mogram/music/mogram_soundcloud.cpp
     mogram/music/mogram_soundcloud.h
     mogram/music/mogram_soundcloud_login.cpp
