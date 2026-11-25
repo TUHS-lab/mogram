@@ -8,6 +8,9 @@
 #include "base/basic_types.h"
 
 class PeerData;
+namespace Main {
+class Session;
+} // namespace Main
 
 namespace Mogram::Tweaks {
 
@@ -19,6 +22,9 @@ namespace Mogram::Tweaks {
 [[nodiscard]] int LocalPinIndex(not_null<PeerData*> peer);
 [[nodiscard]] bool IsLocallyPinned(not_null<PeerData*> peer);
 void ToggleLocalPin(not_null<PeerData*> peer);
+// Весь список закрепов (значения PeerId) и его замена целиком.
+[[nodiscard]] QStringList LocalPinList();
+void SetLocalPinList(not_null<Main::Session*> session, const QStringList &ids);
 
 // Убирает из JPEG и PNG геотег, камеру, автора и время съёмки.
 // Поворот кадра сохраняется. Другие форматы возвращаются как есть.

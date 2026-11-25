@@ -268,6 +268,18 @@ void ToggleLocalPin(not_null<PeerData*> peer) {
 	Resort(&peer->session(), touched);
 }
 
+QStringList LocalPinList() {
+	return PinIds();
+}
+
+void SetLocalPinList(not_null<Main::Session*> session, const QStringList &ids) {
+	auto touched = PinIds();
+	WritePinIds(ids);
+	touched.append(ids);
+	touched.removeDuplicates();
+	Resort(session, touched);
+}
+
 QByteArray StripMetadata(const QByteArray &bytes) {
 	if (bytes.size() < 8) {
 		return bytes;

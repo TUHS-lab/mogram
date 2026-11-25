@@ -18,6 +18,9 @@ void SetTag(PeerId id, const QString &tag);
 void SetNote(PeerId id, const QString &note);
 
 // Срабатывает при любом изменении тега или заметки. Значение: чей именно.
+// Обход всех непустых записей (для синхронизации через Mogram Link).
+void ForEach(Fn<void(PeerId, const QString &tag, const QString &note)> callback);
+
 [[nodiscard]] rpl::producer<PeerId> Changed();
 [[nodiscard]] rpl::producer<QString> NoteValue(PeerId id);
 

@@ -114,6 +114,15 @@ void SetNote(PeerId id, const QString &note) {
 	});
 }
 
+void ForEach(Fn<void(PeerId, const QString &tag, const QString &note)> callback) {
+	Load();
+	for (const auto &[id, entry] : Data().entries) {
+		if (!entry.tag.isEmpty() || !entry.note.isEmpty()) {
+			callback(PeerId(id), entry.tag, entry.note);
+		}
+	}
+}
+
 rpl::producer<PeerId> Changed() {
 	return Data().changed.events();
 }
