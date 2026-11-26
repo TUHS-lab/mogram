@@ -25,6 +25,8 @@
 #include "data/data_session.h"
 #include "history/history.h"
 #include "history/history_item.h"
+#include "dialogs/dialogs_key.h"
+#include "window/main_window.h"
 #include "main/main_domain.h"
 #include "main/main_session.h"
 #include "media/player/media_player_instance.h"
@@ -91,8 +93,12 @@ struct State {
 	base::flat_map<quint64, crl::time> remoteActive;
 	base::Timer stateTimer;
 	base::Timer nowTimer;
+	base::Timer pulseTimer;
+	qint64 pulseChat = 0;
+	crl::time pulseAt = 0;
+	std::vector<quint64> candidates;
 	rpl::lifetime lifetime;
-	rpl::lifetime sessionLifetime;
+	rpl::lifetime appLifetime;
 	bool started = false;
 };
 
@@ -399,7 +405,7 @@ void Handle(const QString &text, MsgId id, crl::time now) {
 	} else if (type == u"act"_q) {
 		if (Flag("activity")) {
 			state.remoteActive.clear();
-			const auto chat = json.value(u"chat"_q).toString().toLongLong();
+			const auto chat = json.value(u"chat"_q).toVariant().toLongLong();
 			if (chat && fresh) {
 				state.remoteActive[PeerFromAndroidDialog(chat).value] = now;
 			}
@@ -469,6 +475,7 @@ void FindOrCreate() {
 		result.match([&](const MTPDcontacts_found &data) {
 			session->data().processUsers(data.vusers());
 			session->data().processChats(data.vchats());
+			auto best = ChannelId();
 			for (const auto &peer : data.vmy_results().v) {
 				const auto id = peerFromMTP(peer);
 				if (!peerIsChannel(id)) {
@@ -479,11 +486,15 @@ void FindOrCreate() {
 				if (channel
 					&& channel->amCreator()
 					&& !channel->isMegagroup()
-					&& channel->name() == U(kChannelTitle)) {
-					state.channel = peerToChannel(id);
-					ChannelReady();
-					return;
+					&& channel->name() == U(kChannelTitle)
+					// Если каналов несколько, все устройства берут самый старый.
+					&& (!best.bare || peerToChannel(id).bare < best.bare)) {
+					best = peerToChannel(id);
 				}
+			}
+			if (best.bare) {
+				state.channel = best;
+				ChannelReady();
 			}
 		});
 		if (state.channel.bare || state.creating) {
@@ -568,9 +579,35 @@ void PublishNow() {
 	Send(json);
 }
 
+void Pulse() {
+	// Раз в 5 секунд сообщаем, какой чат открыт, пока окно активно.
+	auto &state = Data();
+	if (!Enabled() || !Flag("activity") || !state.channel.bare) {
+		return;
+	}
+	auto chat = qint64(0);
+	if (const auto window = Core::App().activePrimaryWindow()) {
+		const auto controller = window->sessionController();
+		if (controller && window->widget()->isActiveWindow()) {
+			if (const auto history = controller->activeChatCurrent().owningHistory()) {
+				chat = AndroidDialogFromPeer(history->peer->id);
+			}
+		}
+	}
+	const auto now = crl::now();
+	if (chat == state.pulseChat && (!chat || now - state.pulseAt < 15000)) {
+		return;
+	}
+	state.pulseChat = chat;
+	state.pulseAt = now;
+	auto json = QJsonObject();
+	json.insert(u"t"_q, u"act"_q);
+	json.insert(u"chat"_q, QString::number(chat));
+	Send(json);
+}
+
 void Attach(Main::Session *session) {
 	auto &state = Data();
-	state.sessionLifetime.destroy();
 	state.lifetime.destroy();
 	state.channel = ChannelId();
 	state.creating = false;
@@ -578,7 +615,6 @@ void Attach(Main::Session *session) {
 	if (!session || !Enabled() || Password().isEmpty()) {
 		return;
 	}
-	state.started = true;
 	FindOrCreate();
 }
 
@@ -679,14 +715,26 @@ void RegisterSettings() {
 
 void Start() {
 	auto &state = Data();
+	if (state.started) {
+		return;
+	}
+	state.started = true;
 	Core::App().domain().activeSessionValue(
 	) | rpl::on_next([=](Main::Session *session) {
 		Attach(session);
-	}, state.sessionLifetime);
+	}, state.appLifetime);
+	Settings::Changed(
+	) | rpl::filter([](const QString &key) {
+		return (key == u"link.enabled"_q);
+	}) | rpl::on_next([](const QString &) {
+		Attach(Data().session);
+	}, state.appLifetime);
 	state.stateTimer.setCallback([] { PublishState(); });
+	state.pulseTimer.setCallback([] { Pulse(); });
+	state.pulseTimer.callEach(5000);
 	Notes::Changed() | rpl::on_next([=](PeerId) {
 		SchedulePublishState();
-	}, state.lifetime);
+	}, state.appLifetime);
 	QObject::connect(
 		QGuiApplication::clipboard(),
 		&QClipboard::dataChanged,
@@ -694,7 +742,7 @@ void Start() {
 	Media::Player::instance()->updatedNotifier(
 	) | rpl::on_next([=](const Media::Player::TrackState &) {
 		PublishNow();
-	}, state.sessionLifetime);
+	}, state.appLifetime);
 }
 
 } // namespace Mogram::Link
